@@ -133,6 +133,55 @@ namespace db::dscart
         return true;
     }
 
+    bool readIcon(std::vector<uint8_t>& out)
+    {
+        // DS banner: 4bpp 32x32 bitmap at 0x20 (4x4 tiles of 8x8, two pixels per byte,
+        // low nibble first), 16-color BGR555 palette at 0x220.
+        static u8 banner[0x23C0];
+        if (R_FAILED(FSUSER_GetLegacyBannerData(MEDIATYPE_GAME_CARD, 0, banner)))
+        {
+            return false;
+        }
+        const u8* bitmap  = banner + 0x20;
+        const u8* palette = banner + 0x220;
+
+        u32 colors[16];
+        for (int i = 0; i < 16; i++)
+        {
+            const u16 c = palette[i * 2] | (palette[i * 2 + 1] << 8);
+            const u32 r = (c & 31) * 255 / 31, g = ((c >> 5) & 31) * 255 / 31,
+                      b = ((c >> 10) & 31) * 255 / 31;
+            colors[i]   = (r << 24) | (g << 16) | (b << 8) | (i == 0 ? 0x00 : 0xFF);
+        }
+
+        // 8x8 Morton (Z-order) index within a GPU tile: x0 y0 x1 y1 x2 y2.
+        auto morton = [](u32 x, u32 y)
+        {
+            return (x & 1) | ((y & 1) << 1) | ((x & 2) << 1) | ((y & 2) << 2) | ((x & 4) << 2) |
+                   ((y & 4) << 3);
+        };
+
+        u32 pixels[32 * 32] = {};
+        for (u32 tile = 0; tile < 16; tile++)
+        {
+            for (u32 ty = 0; ty < 8; ty++)
+            {
+                for (u32 tx = 0; tx < 8; tx++)
+                {
+                    const u8 byte  = bitmap[tile * 32 + ty * 4 + tx / 2];
+                    const u8 index = (tx & 1) ? (byte >> 4) : (byte & 0xF);
+                    const u32 x    = (tile % 4) * 8 + tx;
+                    const u32 y    = (tile / 4) * 8 + ty;
+                    // GPU layout: 8x8 tiles row by row, Morton order inside each tile.
+                    pixels[((y >> 3) * 4 + (x >> 3)) * 64 + morton(x & 7, y & 7)] =
+                        colors[index];
+                }
+            }
+        }
+        out.assign((const u8*)pixels, (const u8*)pixels + sizeof(pixels));
+        return true;
+    }
+
     bool write(const CartInfo& cart, const uint8_t* image, size_t len,
         const std::vector<uint8_t>& expected, std::string& err)
     {

@@ -29,6 +29,19 @@ namespace db
         SdFile,
     };
 
+    // The game's own icon, read from the console (no bundled art):
+    //   Smdh48 - 3DS titles and Virtual Console: the HOME Menu icon, 48x48 RGB565, already
+    //            in the GPU's 8x8-tile Morton order (0x1200 bytes)
+    //   Ds32   - DS cartridges: the banner icon, decoded to 32x32 RGBA8 in GPU tile order
+    //            (4096 bytes)
+    // SD .sav files have no icon anywhere on the console: None.
+    enum class IconKind : uint8_t
+    {
+        None,
+        Smdh48,
+        Ds32,
+    };
+
     struct SaveLocation
     {
         SaveMedium medium     = SaveMedium::SdFile;
@@ -40,7 +53,9 @@ namespace db
         std::string game;                     // game name, e.g. "HeartGold"
         std::string tag;                      // where it lives, e.g. "DS Cart", "Digital"
         PkxFormat format = PkxFormat::Empty;  // generation
-        pksm::GameVersion version;            // which game, for the tile's box art
+        pksm::GameVersion version;            // which game
+        IconKind iconKind = IconKind::None;
+        std::vector<uint8_t> icon;            // pixel data, see IconKind
     };
 
     // Lists every save PKSM-Core recognizes as Gen 1-7. Slow-ish: reads each candidate.

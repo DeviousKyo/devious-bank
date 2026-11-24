@@ -49,8 +49,8 @@ namespace db
         constexpr int STATUS_Y     = 222;
         constexpr u32 STATUS_FRAMES = 180; // a status message shows for ~3 s, then the hint
 
-        // ---- Game select tiles: 4 columns x 2 rows of box-art covers on the top screen.
-        // Each tile is an 84x84 cover with a 12px source label (DS Cart, Digital, ...) below.
+        // ---- Game select tiles: 4 columns x 2 rows on the top screen. Each tile is an 84x84
+        // square holding the game's own icon at 64x64, with a 12px source label below.
         constexpr int CARD_COLS  = 4;
         constexpr int CARD_ROWS  = 2;
         constexpr int COVER      = 84;
@@ -156,7 +156,7 @@ namespace db
         storage.reset();
         save.reset();
         icons.clear();  // icon textures, before citro3d goes away
-        covers.clear(); // box art textures, same
+        gameIcons.clear(); // game icon textures, same
         gfx.fini();     // text buffer, render targets, citro2d, citro3d, gfx
         if (i18nUp)
         {
@@ -217,6 +217,7 @@ namespace db
     {
         progressFrame("Looking for Pokemon saves...");
         // If AM failed to start, the title scan finds nothing and only SD saves are listed.
+        gameIcons.clear(); // icons are cached by list position, which the rescan changes
         saves      = scanSaves();
         listCursor = 0;
     }
@@ -230,7 +231,7 @@ namespace db
         sel.reset();
         ySelecting = false;
         touchStart = -1;
-        covers.clear(); // box art isn't shown in the boxes; free it
+        gameIcons.clear(); // not shown in the boxes; free them
 
         if (listCursor > 0)
         {
@@ -340,6 +341,7 @@ namespace db
         }
         menu.push_back({"Button guide", col::TEXT, MenuAction::Help});
         menu.push_back({"Back", col::DIM, MenuAction::Back});
+        menuTitle  = "Menu";
         menuCursor = 0;
         state      = State::Menu;
     }
@@ -781,6 +783,21 @@ namespace db
             clearSelection();
             setStatus("Selection cleared", col::DIM);
         }
+        else if (storage && storage->dirty())
+        {
+            // Nothing in hand: B means "leave". Ask about unsaved changes first.
+            menu.clear();
+            menu.push_back({"Save, then go to game list", col::GOOD, MenuAction::SaveReturn});
+            menu.push_back({"Go to game list WITHOUT saving", col::WARN, MenuAction::ReturnNoSave});
+            menu.push_back({"Stay here", col::DIM, MenuAction::Back});
+            menuTitle  = "Save before going back?";
+            menuCursor = 0;
+            state      = State::Menu;
+        }
+        else
+        {
+            returnToGameList(false);
+        }
     }
 
     void App::changeBox(int delta)
@@ -981,8 +998,6 @@ namespace db
         const int rows     = (entries + CARD_COLS - 1) / CARD_COLS;
         const int curRow   = listCursor / CARD_COLS;
         const int firstRow = std::clamp(curRow - 1, 0, std::max(0, rows - CARD_ROWS));
-        std::unordered_set<std::string> keep;
-
         for (int r = 0; r < CARD_ROWS; r++)
         {
             for (int c = 0; c < CARD_COLS; c++)
@@ -994,16 +1009,16 @@ namespace db
                 float x = CARD_X0 + c * (CARD_W + CARD_GX);
                 float y = CARD_Y0 + r * (CARD_H + CARD_GY);
 
-                // Bank tile: a plain square. Game tiles: the box art.
-                const C2D_Image* cover = nullptr;
-                std::string label      = "Bank only";
+                // Bank tile: a plain square. Game tiles: the game's own icon.
+                const C2D_Image* icon = nullptr;
+                float iconScale       = 1.0f;
+                std::string label     = "Bank only";
                 if (idx > 0)
                 {
                     const SaveLocation& s = saves[idx - 1];
-                    const std::string key = coverKeyFor(s.version);
-                    keep.insert(key);
-                    cover = covers.get(key);
-                    label = s.tag;
+                    icon                  = gameIcons.get(idx - 1, s);
+                    iconScale             = GameIconCache::scaleFor(s.iconKind);
+                    label                 = s.tag;
                 }
 
                 if (isSel)
@@ -1014,13 +1029,14 @@ namespace db
                     gfx.rect(x - 2, y - 2, CARD_W + 4, CARD_H + 4, col::CURSOR);
                 }
                 gfx.rect(x, y, CARD_W, CARD_H, isSel ? col::CARD_SEL : col::CARD);
-                if (cover)
+                if (icon)
                 {
-                    gfx.image(*cover, x, y, 1.0f);
+                    constexpr float ICON = 64, PAD = (COVER - ICON) / 2; // centered 64x64
+                    gfx.image(*icon, x + PAD, y + PAD, iconScale);
                 }
                 else if (idx > 0)
                 {
-                    // No box art for this game: fall back to its name.
+                    // No icon (a .sav from the SD card): show the game's name instead.
                     gfx.text(x + COVER / 2, y + COVER / 2 - 8, 0.42f, col::TEXT,
                         saves[idx - 1].game, Align::Center, COVER - 6);
                 }
@@ -1028,7 +1044,6 @@ namespace db
                     Align::Center, CARD_W - 4);
             }
         }
-        covers.retainOnly(keep); // only the covers on screen stay in memory
 
         if (rows > CARD_ROWS)
         {
@@ -1172,7 +1187,7 @@ namespace db
             hint = "Selected " + std::to_string(sel->count()) +
                    ": A pick up  X send all  B clear";
         else
-            hint = "A pick up  Y+move select  X send  START menu & button guide";
+            hint = "A pick up  Y+move select  X send  B game list  START menu";
         gfx.text(10, STATUS_Y + 3, 0.4f, col::DIM, hint, Align::Left, TOP_W - 16);
     }
 
@@ -1350,7 +1365,7 @@ namespace db
         const float w = 240, h = 40 + menu.size() * 26.0f;
         const float x = (TOP_W - w) / 2, y = (SCREEN_H - h) / 2;
         gfx.rect(x, y, w, h, col::CARD);
-        gfx.text(TOP_W / 2, y + 8, 0.5f, col::TEXT, "Menu", Align::Center);
+        gfx.text(TOP_W / 2, y + 8, 0.5f, col::TEXT, menuTitle, Align::Center, w - 16);
         for (size_t i = 0; i < menu.size(); i++)
         {
             const float iy = y + 32 + i * 26.0f;
@@ -1377,7 +1392,7 @@ namespace db
             {"Y", nullptr, "Hold + move: select an area (or drag the stylus)"},
             {"A", nullptr, "On a selection: pick up the whole group"},
             {"X", nullptr, "Send to the Bank (from the Bank: to the save)"},
-            {"B", nullptr, "Put back / clear the selection"},
+            {"B", nullptr, "Put back / clear selection / back to game list"},
             {"L", "R", "Previous / next box"},
             {"SELECT", nullptr, "Switch between Save and Bank"},
             {"START", nullptr, "Menu: game list, save, exit, this guide"},
@@ -1447,7 +1462,6 @@ namespace db
             "  SciresM, Epicpkmn11",
             "memecrypto - SciresM (FlagBrew fork)",
             "PKHeX - kwsch: format research and box sprites",
-            "Box art: libretro-thumbnails project",
             "DS cart SPI (modified): PKSM, from TWLSaveTool (TuxSH)",
             "  and savegame-manager (Pokedoc)",
             "",

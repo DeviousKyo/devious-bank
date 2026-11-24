@@ -22,7 +22,7 @@
 #include "core/db_bank.hpp"
 #include "core/db_save.hpp"
 #include "core/db_storage.hpp"
-#include "ui/db_covers.hpp"
+#include "ui/db_gameicons.hpp"
 #include "ui/db_gfx.hpp"
 #include "ui/db_icons.hpp"
 #include "ui/db_snow.hpp"
@@ -146,7 +146,7 @@ namespace db
 
         ui::Gfx gfx;
         ui::IconCache icons;   // must be cleared before gfx.fini()
-        ui::CoverCache covers; // game-list box art; same rule
+        ui::GameIconCache gameIcons; // game-list tile icons; same rule
         ui::Snow snow;
         Bank bank;
         std::unique_ptr<SaveSource> save;
@@ -163,7 +163,8 @@ namespace db
         bool helpShown    = false; // the guide pops up once, the first time a box opens
 
         std::vector<MenuItem> menu;
-        int menuCursor = 0;
+        std::string menuTitle = "Menu";
+        int menuCursor        = 0;
 
         Pane pane     = Pane::Bank;
         int boxIdx[2] = {0, 0};
