@@ -87,8 +87,6 @@ namespace db::ui
 
         void rect(float x, float y, float w, float h, u32 color);
         void frame(float x, float y, float w, float h, float t, u32 color);
-        // Rounded rectangle. Use opaque colors: the corner circles overlap the body.
-        void roundRect(float x, float y, float w, float h, float r, u32 color);
         // Vertical gradient, top color to bottom color.
         void gradient(float x, float y, float w, float h, u32 top, u32 bottom);
         void circle(float cx, float cy, float r, u32 color);

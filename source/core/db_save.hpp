@@ -39,7 +39,8 @@ namespace db
         std::string label;                    // full "<game> [<tag>]" text for messages
         std::string game;                     // game name, e.g. "HeartGold"
         std::string tag;                      // where it lives, e.g. "DS Cart", "Digital"
-        PkxFormat format = PkxFormat::Empty;  // generation, for the tile color
+        PkxFormat format = PkxFormat::Empty;  // generation
+        pksm::GameVersion version;            // which game, for the tile's box art
     };
 
     // Lists every save PKSM-Core recognizes as Gen 1-7. Slow-ish: reads each candidate.

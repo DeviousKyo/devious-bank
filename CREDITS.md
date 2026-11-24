@@ -38,6 +38,11 @@ notice.
 By kwsch and contributors: <https://github.com/kwsch/PKHeX> — GPLv3.
 Format research behind PKSM-Core, and the Pokémon box sprites.
 
+## Game box art — `assets/covers/`, `romfs/gfx/covers/`
+From the libretro-thumbnails project (<https://github.com/libretro-thumbnails>), Named_Boxarts
+of the Game Boy, Game Boy Color, Game Boy Advance, Nintendo DS and Nintendo 3DS sets (USA
+covers). Scaled down to 84x84 by `tools/convert_covers.ps1`. Box art is © its publishers.
+
 ## Trademarks
 Pokémon and all related names and images are trademarks and © of Nintendo, Game Freak and
 Creatures Inc.

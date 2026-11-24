@@ -145,8 +145,9 @@ namespace db
         // Fills the display fields of a location found by a scan.
         void describe(SaveLocation& loc, const pksm::Sav& sav, const std::string& tag)
         {
-            loc.game  = gameLabel(sav);
-            loc.tag   = tag;
+            loc.game    = gameLabel(sav);
+            loc.tag     = tag;
+            loc.version = sav.version();
             loc.label = loc.game + " [" + tag + "]";
             (void)formatFromGeneration(sav.generation(), loc.format);
         }

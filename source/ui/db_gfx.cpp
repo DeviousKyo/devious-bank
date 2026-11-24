@@ -97,23 +97,6 @@ namespace db::ui
         rect(x + w - t, y, t, h, color);
     }
 
-    void Gfx::roundRect(float x, float y, float w, float h, float r, u32 color)
-    {
-        r = std::min({r, w / 2, h / 2});
-        if (r <= 0.5f)
-        {
-            rect(x, y, w, h, color);
-            return;
-        }
-        rect(x + r, y, w - 2 * r, h, color); // center column
-        rect(x, y + r, r, h - 2 * r, color); // left edge
-        rect(x + w - r, y + r, r, h - 2 * r, color); // right edge
-        C2D_DrawCircleSolid(x + r, y + r, 0.5f, r, color);
-        C2D_DrawCircleSolid(x + w - r, y + r, 0.5f, r, color);
-        C2D_DrawCircleSolid(x + r, y + h - r, 0.5f, r, color);
-        C2D_DrawCircleSolid(x + w - r, y + h - r, 0.5f, r, color);
-    }
-
     void Gfx::gradient(float x, float y, float w, float h, u32 top, u32 bottom)
     {
         C2D_DrawRectangle(x, y, 0.5f, w, h, top, top, bottom, bottom);

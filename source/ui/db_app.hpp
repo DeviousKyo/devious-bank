@@ -9,7 +9,8 @@
 //                         the other side (Save -> Bank, Bank -> Save) into free slots
 //     B                   cancel / clear selection     L / R   previous / next box
 //     SELECT              switch Save <-> Bank         START   menu
-//   Menu: save & exit, exit without saving, button guide, back
+//   Menu: back to the game list (save first or discard), save & exit, exit without
+//         saving, button guide, back
 //   Help: the button guide (shown automatically the first time a box opens)
 //   Message: modal text, A/B returns to the previous state
 //   Credits (X on GameSelect): attributions required by the GPLv3 7b terms
@@ -21,6 +22,7 @@
 #include "core/db_bank.hpp"
 #include "core/db_save.hpp"
 #include "core/db_storage.hpp"
+#include "ui/db_covers.hpp"
 #include "ui/db_gfx.hpp"
 #include "ui/db_icons.hpp"
 #include "ui/db_snow.hpp"
@@ -74,6 +76,9 @@ namespace db
 
         enum class MenuAction
         {
+            SaveReturn,   // save, then back to the game list
+            ReturnNoSave, // discard changes, back to the game list
+            Return,       // nothing to save: back to the game list
             SaveExit,
             ExitNoSave,
             Exit,
@@ -96,6 +101,9 @@ namespace db
         void progressFrame(const std::string& text);
         void openMenu();
         void runMenuAction(MenuAction a);
+        // Closes the open save and shows the game list. `discard` also throws away unsaved
+        // bank changes by reloading the bank file.
+        void returnToGameList(bool discard);
 
         // ---- input
         void inputGameSelect(u32 down, u32 repeat);
@@ -137,7 +145,8 @@ namespace db
         void refreshCaches();
 
         ui::Gfx gfx;
-        ui::IconCache icons; // must be cleared before gfx.fini()
+        ui::IconCache icons;   // must be cleared before gfx.fini()
+        ui::CoverCache covers; // game-list box art; same rule
         ui::Snow snow;
         Bank bank;
         std::unique_ptr<SaveSource> save;

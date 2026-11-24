@@ -49,15 +49,18 @@ namespace db
         constexpr int STATUS_Y     = 222;
         constexpr u32 STATUS_FRAMES = 180; // a status message shows for ~3 s, then the hint
 
-        // ---- Game select tiles: 2 columns x 3 rows of cards on the top screen.
-        constexpr int CARD_COLS = 2;
-        constexpr int CARD_ROWS = 3;
-        constexpr int CARD_W    = 184;
-        constexpr int CARD_H    = 54;
-        constexpr int CARD_GX   = 12;
-        constexpr int CARD_GY   = 10;
-        constexpr int CARD_X0   = (TOP_W - CARD_COLS * CARD_W - CARD_GX) / 2;
-        constexpr int CARD_Y0   = 38;
+        // ---- Game select tiles: 4 columns x 2 rows of box-art covers on the top screen.
+        // Each tile is an 84x84 cover with a 12px source label (DS Cart, Digital, ...) below.
+        constexpr int CARD_COLS  = 4;
+        constexpr int CARD_ROWS  = 2;
+        constexpr int COVER      = 84;
+        constexpr int LABEL_H    = 12;
+        constexpr int CARD_W     = COVER;
+        constexpr int CARD_H     = COVER + LABEL_H;
+        constexpr int CARD_GX    = 12;
+        constexpr int CARD_GY    = 10;
+        constexpr int CARD_X0    = (TOP_W - CARD_COLS * CARD_W - (CARD_COLS - 1) * CARD_GX) / 2;
+        constexpr int CARD_Y0    = 32;
 
         std::vector<std::string> wrap(const std::string& text, size_t width)
         {
@@ -152,8 +155,9 @@ namespace db
         // every archive/file handle is scoped to a single read or write).
         storage.reset();
         save.reset();
-        icons.clear(); // icon textures, before citro3d goes away
-        gfx.fini();    // text buffer, render targets, citro2d, citro3d, gfx
+        icons.clear();  // icon textures, before citro3d goes away
+        covers.clear(); // box art textures, same
+        gfx.fini();     // text buffer, render targets, citro2d, citro3d, gfx
         if (i18nUp)
         {
             i18n::exit();
@@ -226,6 +230,7 @@ namespace db
         sel.reset();
         ySelecting = false;
         touchStart = -1;
+        covers.clear(); // box art isn't shown in the boxes; free it
 
         if (listCursor > 0)
         {
@@ -323,11 +328,14 @@ namespace db
         menu.clear();
         if (storage && storage->dirty())
         {
+            menu.push_back({"Save, then go to game list", col::GOOD, MenuAction::SaveReturn});
             menu.push_back({"Save everything and exit", col::GOOD, MenuAction::SaveExit});
+            menu.push_back({"Game list WITHOUT saving", col::WARN, MenuAction::ReturnNoSave});
             menu.push_back({"Exit WITHOUT saving", col::WARN, MenuAction::ExitNoSave});
         }
         else
         {
+            menu.push_back({"Back to game list", col::TEXT, MenuAction::Return});
             menu.push_back({"Exit", col::TEXT, MenuAction::Exit});
         }
         menu.push_back({"Button guide", col::TEXT, MenuAction::Help});
@@ -340,6 +348,29 @@ namespace db
     {
         switch (a)
         {
+            case MenuAction::SaveReturn:
+            {
+                std::string err;
+                if (saveAll(err))
+                {
+                    returnToGameList(false);
+                }
+                else
+                {
+                    state = State::BoxView;
+                    showMessage("Save failed: " + err +
+                                    "\nNothing was lost: your moves are still here and the "
+                                    "backups are in sdmc:/3ds/DB/backups/",
+                        true);
+                }
+                break;
+            }
+            case MenuAction::ReturnNoSave:
+                returnToGameList(true);
+                break;
+            case MenuAction::Return:
+                returnToGameList(false);
+                break;
             case MenuAction::SaveExit:
             {
                 std::string err;
@@ -369,6 +400,32 @@ namespace db
                 state = State::BoxView;
                 break;
         }
+    }
+
+    void App::returnToGameList(bool discard)
+    {
+        held.reset();
+        group.reset();
+        clearSelection();
+        touchStart = -1;
+        storage.reset();
+        save.reset(); // the game save's unsaved moves go with it; the file is untouched
+        icons.clear();
+
+        if (discard && bank.dirty())
+        {
+            // Throw away unsaved bank moves by reloading the file as it is on the SD card.
+            std::string err;
+            bank.load(fs::BANK_PATH, err);
+            if (!err.empty())
+            {
+                showMessage(err, bank.readOnly());
+            }
+        }
+        storage = std::make_unique<Storage>(bank, nullptr);
+        status.clear();
+        state = State::GameSelect;
+        scan(); // the cart in the slot may have changed while the boxes were open
     }
 
     // =====================================================================================
@@ -851,7 +908,7 @@ namespace db
             return 16;
         }
         const float w = 8 + 6.5f * std::strlen(name);
-        gfx.roundRect(x, y, w, 16, 8, rgba(0x5A, 0x60, 0x78));
+        gfx.rect(x, y, w, 16, rgba(0x5A, 0x60, 0x78));
         gfx.text(x + w / 2, y + 2, 0.36f, col::TEXT, name, Align::Center, w - 4);
         return w;
     }
@@ -924,6 +981,7 @@ namespace db
         const int rows     = (entries + CARD_COLS - 1) / CARD_COLS;
         const int curRow   = listCursor / CARD_COLS;
         const int firstRow = std::clamp(curRow - 1, 0, std::max(0, rows - CARD_ROWS));
+        std::unordered_set<std::string> keep;
 
         for (int r = 0; r < CARD_ROWS; r++)
         {
@@ -936,49 +994,48 @@ namespace db
                 float x = CARD_X0 + c * (CARD_W + CARD_GX);
                 float y = CARD_Y0 + r * (CARD_H + CARD_GY);
 
-                std::string title, tag, badge;
-                u32 accent;
-                if (idx == 0)
-                {
-                    title  = "Bank only";
-                    tag    = "Just your bank, no game save";
-                    badge  = "Bank";
-                    accent = col::GEN[0];
-                }
-                else
+                // Bank tile: a plain square. Game tiles: the box art.
+                const C2D_Image* cover = nullptr;
+                std::string label      = "Bank only";
+                if (idx > 0)
                 {
                     const SaveLocation& s = saves[idx - 1];
-                    const int g           = std::clamp((int)s.format, 1, 7);
-                    title                 = s.game;
-                    tag                   = s.tag;
-                    badge                 = "Gen " + std::to_string(g);
-                    accent                = col::GEN[g];
+                    const std::string key = coverKeyFor(s.version);
+                    keep.insert(key);
+                    cover = covers.get(key);
+                    label = s.tag;
                 }
 
                 if (isSel)
                 {
-                    // Raised card: lift it, drop a shadow, outline it.
-                    gfx.roundRect(x + 3, y + 4, CARD_W, CARD_H, 8, rgba(0x08, 0x0C, 0x18));
+                    // Raised tile: lift it, drop a shadow, outline it.
+                    gfx.rect(x + 3, y + 4, CARD_W, CARD_H, rgba(0x08, 0x0C, 0x18));
                     y -= 3;
-                    gfx.roundRect(x - 2, y - 2, CARD_W + 4, CARD_H + 4, 9, col::CURSOR);
+                    gfx.rect(x - 2, y - 2, CARD_W + 4, CARD_H + 4, col::CURSOR);
                 }
-                gfx.roundRect(x, y, CARD_W, CARD_H, 7, isSel ? col::CARD_SEL : col::CARD);
-                gfx.roundRect(x + 8, y + 9, 5, CARD_H - 18, 2.5f, accent);
-                gfx.text(x + 22, y + 8, 0.55f, col::TEXT, title, Align::Left, CARD_W - 84);
-                gfx.text(x + 22, y + 31, 0.4f, col::DIM, tag, Align::Left, CARD_W - 30);
-                gfx.roundRect(x + CARD_W - 52, y + 9, 44, 16, 8, accent);
-                gfx.text(x + CARD_W - 30, y + 11, 0.38f, col::TEXT, badge, Align::Center, 40);
+                gfx.rect(x, y, CARD_W, CARD_H, isSel ? col::CARD_SEL : col::CARD);
+                if (cover)
+                {
+                    gfx.image(*cover, x, y, 1.0f);
+                }
+                else if (idx > 0)
+                {
+                    // No box art for this game: fall back to its name.
+                    gfx.text(x + COVER / 2, y + COVER / 2 - 8, 0.42f, col::TEXT,
+                        saves[idx - 1].game, Align::Center, COVER - 6);
+                }
+                gfx.text(x + CARD_W / 2, y + COVER, 0.34f, isSel ? col::TEXT : col::DIM, label,
+                    Align::Center, CARD_W - 4);
             }
         }
+        covers.retainOnly(keep); // only the covers on screen stay in memory
 
-        // Scroll hints
-        if (firstRow > 0)
+        if (rows > CARD_ROWS)
         {
-            gfx.text(TOP_W / 2, CARD_Y0 - 14, 0.4f, col::DIM, "more above", Align::Center);
-        }
-        if (firstRow + CARD_ROWS < rows)
-        {
-            gfx.text(TOP_W / 2, SCREEN_H - 16, 0.4f, col::DIM, "more below", Align::Center);
+            gfx.text(TOP_W - 12, 22, 0.36f, col::DIM,
+                "rows " + std::to_string(firstRow + 1) + "-" +
+                    std::to_string(firstRow + CARD_ROWS) + " of " + std::to_string(rows),
+                Align::Right);
         }
     }
 
@@ -988,14 +1045,17 @@ namespace db
         if (state == State::Credits ||
             (state == State::Message && messageReturn == State::Credits))
         {
-            gfx.roundRect(px, 90, pw, 50, 10, col::CARD);
+            gfx.rect(px, 90, pw, 50, col::CARD);
             const float w = drawButton(BOTTOM_W / 2 - 40, 107, "B");
             gfx.text(BOTTOM_W / 2 - 40 + w + 8, 107, 0.48f, col::TEXT, "Back");
             return;
         }
 
-        gfx.roundRect(px, py, pw, 118, 10, col::CARD);
-        gfx.text(BOTTOM_W / 2, py + 8, 0.5f, col::TEXT, "Choose a save", Align::Center);
+        gfx.rect(px, py, pw, 118, col::CARD);
+        // The tiles only show box art, so name the highlighted one here.
+        const std::string selected =
+            listCursor == 0 ? "Bank only (no game save)" : saves[listCursor - 1].label;
+        gfx.text(BOTTOM_W / 2, py + 8, 0.5f, col::TEXT, selected, Align::Center, pw - 16);
 
         // 2x2 button guide
         struct Row
@@ -1013,7 +1073,7 @@ namespace db
         }
         gfx.text(BOTTOM_W / 2, py + 98, 0.36f, col::DIM, "+Pad: choose a tile", Align::Center);
 
-        gfx.roundRect(px, 150, pw, 62, 10, col::CARD);
+        gfx.rect(px, 150, pw, 62, col::CARD);
         gfx.text(px + 14, 158, 0.4f, col::TEXT, "Gen 4/5 DS cart: insert it, then press Y");
         gfx.text(px + 14, 176, 0.4f, col::TEXT, "GBA / emulator saves: copy .sav files to");
         gfx.text(px + 14, 192, 0.4f, col::DIM, "sdmc:/3ds/DB/saves/");
@@ -1134,7 +1194,7 @@ namespace db
         gfx.rect(0, 0, BOTTOM_W, HEADER_H, hdr);
         drawButton(6, 6, "L");
         drawButton(BOTTOM_W - 6 - 14.5f, 6, "R");
-        gfx.roundRect(30, 5, 44, 18, 9, rgba(0x00, 0x00, 0x00));
+        gfx.rect(30, 5, 44, 18, rgba(0x00, 0x00, 0x00));
         gfx.text(52, 7, 0.42f, col::TEXT, pane == Pane::Save ? "SAVE" : "BANK", Align::Center);
         gfx.text(82, 6, 0.48f, col::TEXT, box.name, Align::Left, 160);
         gfx.text(BOTTOM_W - 28, 7, 0.42f, col::TEXT,
@@ -1175,7 +1235,7 @@ namespace db
         };
 
         // ---- Tray and tiles
-        gfx.roundRect(GRID_X - 7, GRID_Y - 6, GRID_W + 14, GRID_H + 12, 10, col::TRAY);
+        gfx.rect(GRID_X - 7, GRID_Y - 6, GRID_W + 14, GRID_H + 12, col::TRAY);
         const float bob = std::sin(frame * 0.08f) * 1.2f;
 
         for (int i = 0; i < BOX_SLOTS; i++)
@@ -1189,18 +1249,18 @@ namespace db
 
             // Outline drawn behind the tile so it reads as a rounded border.
             if (hover)
-                gfx.roundRect(x - 2, y - 2, TILE_W + 4, TILE_H + 4, 7, modeColor());
+                gfx.rect(x - 2, y - 2, TILE_W + 4, TILE_H + 4, modeColor());
             else if (preview[i])
-                gfx.roundRect(x - 2, y - 2, TILE_W + 4, TILE_H + 4, 7,
+                gfx.rect(x - 2, y - 2, TILE_W + 4, TILE_H + 4,
                     previewFits ? col::MODE_GROUP : col::WARN);
             else if (marked)
-                gfx.roundRect(x - 2, y - 2, TILE_W + 4, TILE_H + 4, 7, col::MODE_SELECT);
+                gfx.rect(x - 2, y - 2, TILE_W + 4, TILE_H + 4, col::MODE_SELECT);
 
             u32 bg = col::CELL;
             if (c.bad) bg = col::CELL_BAD;
             else if (hover) bg = col::CELL_HOVER;
             else if (c.present && !origin) bg = col::CELL_FULL;
-            gfx.roundRect(x, y, TILE_W, TILE_H, 5, bg);
+            gfx.rect(x, y, TILE_W, TILE_H, bg);
             if (marked)
             {
                 gfx.rect(x + 2, y + 2, TILE_W - 4, TILE_H - 4, col::SELECT_TINT);
@@ -1289,15 +1349,15 @@ namespace db
         gfx.rect(0, 0, TOP_W, SCREEN_H, col::OVERLAY);
         const float w = 240, h = 40 + menu.size() * 26.0f;
         const float x = (TOP_W - w) / 2, y = (SCREEN_H - h) / 2;
-        gfx.roundRect(x, y, w, h, 10, col::CARD);
+        gfx.rect(x, y, w, h, col::CARD);
         gfx.text(TOP_W / 2, y + 8, 0.5f, col::TEXT, "Menu", Align::Center);
         for (size_t i = 0; i < menu.size(); i++)
         {
             const float iy = y + 32 + i * 26.0f;
             if ((int)i == menuCursor)
             {
-                gfx.roundRect(x + 10, iy - 2, w - 20, 22, 6, col::CARD_SEL);
-                gfx.roundRect(x + 10, iy - 2, 4, 22, 2, col::CURSOR);
+                gfx.rect(x + 10, iy - 2, w - 20, 22, col::CARD_SEL);
+                gfx.rect(x + 10, iy - 2, 4, 22, col::CURSOR);
             }
             gfx.text(x + 24, iy + 1, 0.46f, menu[i].color, menu[i].label);
         }
@@ -1320,11 +1380,11 @@ namespace db
             {"B", nullptr, "Put back / clear the selection"},
             {"L", "R", "Previous / next box"},
             {"SELECT", nullptr, "Switch between Save and Bank"},
-            {"START", nullptr, "Menu: save, exit, this guide"},
+            {"START", nullptr, "Menu: game list, save, exit, this guide"},
         };
 
         gfx.rect(0, 0, TOP_W, SCREEN_H, col::OVERLAY);
-        gfx.roundRect(10, 6, TOP_W - 20, SCREEN_H - 12, 10, col::CARD);
+        gfx.rect(10, 6, TOP_W - 20, SCREEN_H - 12, col::CARD);
         gfx.text(TOP_W / 2, 12, 0.55f, col::TEXT, "Button guide", Align::Center);
 
         float y = 38;
@@ -1347,7 +1407,7 @@ namespace db
     {
         // Cursor colors, drawn as sample tiles on the bottom screen.
         gfx.rect(0, 0, BOTTOM_W, SCREEN_H, col::OVERLAY);
-        gfx.roundRect(14, 14, BOTTOM_W - 28, SCREEN_H - 28, 10, col::CARD);
+        gfx.rect(14, 14, BOTTOM_W - 28, SCREEN_H - 28, col::CARD);
         gfx.text(BOTTOM_W / 2, 22, 0.5f, col::TEXT, "Cursor colors", Align::Center);
 
         struct Sample
@@ -1364,8 +1424,8 @@ namespace db
         float y = 50;
         for (const Sample& s : samples)
         {
-            gfx.roundRect(36, y - 2, 30, 26, 6, s.color);
-            gfx.roundRect(38, y, 26, 22, 5, col::CELL_HOVER);
+            gfx.rect(36, y - 2, 30, 26, s.color);
+            gfx.rect(38, y, 26, 22, col::CELL_HOVER);
             gfx.text(80, y + 3, 0.45f, col::TEXT, s.what);
             y += 34;
         }
@@ -1387,13 +1447,14 @@ namespace db
             "  SciresM, Epicpkmn11",
             "memecrypto - SciresM (FlagBrew fork)",
             "PKHeX - kwsch: format research and box sprites",
+            "Box art: libretro-thumbnails project",
             "DS cart SPI (modified): PKSM, from TWLSaveTool (TuxSH)",
             "  and savegame-manager (Pokedoc)",
             "",
             "Pokemon and all related names are trademarks of",
             "Nintendo, Game Freak and Creatures Inc.",
         };
-        gfx.roundRect(8, 6, TOP_W - 16, SCREEN_H - 12, 10, col::CARD);
+        gfx.rect(8, 6, TOP_W - 16, SCREEN_H - 12, col::CARD);
         gfx.text(TOP_W / 2, 10, 0.5f, col::TEXT, "Credits", Align::Center);
         int y = 32;
         for (const char* line : LINES)
@@ -1410,8 +1471,8 @@ namespace db
         const int h      = 40 + (int)lines.size() * 16;
         const int y0     = std::max(10, (SCREEN_H - h) / 2);
         gfx.rect(0, 0, TOP_W, SCREEN_H, col::OVERLAY);
-        gfx.roundRect(18, y0 - 2, TOP_W - 36, h + 4, 10, messageError ? col::WARN : col::GOOD);
-        gfx.roundRect(20, y0, TOP_W - 40, h, 9, col::CARD);
+        gfx.rect(18, y0 - 2, TOP_W - 36, h + 4, messageError ? col::WARN : col::GOOD);
+        gfx.rect(20, y0, TOP_W - 40, h, col::CARD);
         int y = y0 + 10;
         for (const auto& line : lines)
         {
