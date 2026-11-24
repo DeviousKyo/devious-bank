@@ -346,9 +346,11 @@ namespace db::net
             closeSock(sock);
             return false;
         }
-        peer = ip;
+        peer   = ip;
+        target = addr.sin_addr.s_addr;
 
-        if (::connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0)
+        if (::connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0 ||
+            errno == EISCONN)
         {
             state = State::Connected;
             return true;
@@ -359,7 +361,7 @@ namespace db::net
             started = osGetTime();
             return true;
         }
-        err = "Couldn't reach " + ip;
+        err = "Couldn't reach " + ip + " (error " + std::to_string(errno) + ")";
         closeSock(sock);
         peer.clear();
         return false;
@@ -394,33 +396,40 @@ namespace db::net
 
         if (state == State::Connecting)
         {
-            pollfd pfd{};
-            pfd.fd     = sock;
-            pfd.events = POLLOUT;
-            int r      = ::poll(&pfd, 1, 0);
-            if (r < 0 && !wouldBlock(errno))
+            // Finishing a non-blocking connect. Asking the socket for SO_ERROR is unreliable
+            // on the 3DS (a working connection can read as failed, which made the guest hang
+            // up right after the host accepted). Instead, call connect() again: EISCONN (or
+            // 0) means connected, EALREADY / EINPROGRESS means still connecting, anything
+            // else is a real failure.
+            // poll() isn't trusted either: the connect() re-check runs every frame, which is
+            // harmless while connecting (it just reports EALREADY / EINPROGRESS).
             {
-                fail("Couldn't reach " + peer);
-                return;
-            }
-            if (r > 0 && (pfd.revents & (POLLOUT | POLLERR | POLLHUP)))
-            {
-                int soErr         = 0;
-                socklen_t soErrLen = sizeof(soErr);
-                if (getsockopt(sock, SOL_SOCKET, SO_ERROR, &soErr, &soErrLen) != 0 || soErr != 0)
+                sockaddr_in addr{};
+                addr.sin_family      = AF_INET;
+                addr.sin_port        = htons(TRADE_PORT);
+                addr.sin_addr.s_addr = target;
+                const int rc = ::connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+                const int e  = errno;
+                if (rc == 0 || e == EISCONN)
                 {
-                    fail("Couldn't reach " + peer);
+                    state = State::Connected;
+                }
+                else if (e == EALREADY || e == EINPROGRESS || wouldBlock(e))
+                {
+                    // Not there yet: keep waiting (the timeout below still applies).
+                }
+                else
+                {
+                    fail("Couldn't reach " + peer + " (error " + std::to_string(e) + ")");
                     return;
                 }
-                state = State::Connected;
             }
-            else if (osGetTime() - started > CONNECT_TIMEOUT)
+            if (state == State::Connecting)
             {
-                fail("Couldn't reach " + peer);
-                return;
-            }
-            else
-            {
+                if (osGetTime() - started > CONNECT_TIMEOUT)
+                {
+                    fail("Couldn't reach " + peer + " (timed out)");
+                }
                 return;
             }
         }

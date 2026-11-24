@@ -129,6 +129,7 @@ namespace db::net
         int listenSock   = -1;
         int sock         = -1;
         uint64_t started = 0;
+        uint32_t target  = 0; // guest: host address (network byte order), to re-check connect
         std::string err;
         std::string peer;
         std::vector<uint8_t> inBuf;
