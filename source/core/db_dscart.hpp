@@ -33,11 +33,6 @@ namespace db::dscart
     bool detect(CartInfo& out, std::string& err);
 
     bool read(const CartInfo& cart, std::vector<uint8_t>& out, std::string& err);
-
-    // The inserted cart's 32x32 icon as the system provides it: RGB565 in the GPU's
-    // 8x8-tile Morton order, 2048 bytes.
-    bool readIcon(std::vector<uint8_t>& out);
-
     // Writes `image` over a save whose current contents must equal `expected`.
     bool write(const CartInfo& cart, const uint8_t* image, size_t len,
         const std::vector<uint8_t>& expected, std::string& err);

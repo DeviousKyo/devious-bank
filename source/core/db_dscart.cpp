@@ -133,21 +133,6 @@ namespace db::dscart
         return true;
     }
 
-    bool readIcon(std::vector<uint8_t>& out)
-    {
-        // The system hands back the cart's icon already converted for the 3DS: the first
-        // 32*32*2 bytes are a 32x32 RGB565 image in the GPU's 8x8-tile Morton order (the
-        // same format as a 3DS title's HOME Menu icon; Checkpoint reads it the same way).
-        // It is NOT the raw DS banner, so it must not be palette-decoded.
-        static u8 banner[0x23C0];
-        if (R_FAILED(FSUSER_GetLegacyBannerData(MEDIATYPE_GAME_CARD, 0, banner)))
-        {
-            return false;
-        }
-        out.assign(banner, banner + 32 * 32 * 2);
-        return true;
-    }
-
     bool write(const CartInfo& cart, const uint8_t* image, size_t len,
         const std::vector<uint8_t>& expected, std::string& err)
     {

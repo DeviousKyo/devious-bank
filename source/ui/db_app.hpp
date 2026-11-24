@@ -22,7 +22,7 @@
 #include "core/db_bank.hpp"
 #include "core/db_save.hpp"
 #include "core/db_storage.hpp"
-#include "ui/db_gameicons.hpp"
+#include "ui/db_gameart.hpp"
 #include "ui/db_gfx.hpp"
 #include "ui/db_icons.hpp"
 #include "ui/db_snow.hpp"
@@ -146,7 +146,7 @@ namespace db
 
         ui::Gfx gfx;
         ui::IconCache icons;   // must be cleared before gfx.fini()
-        ui::GameIconCache gameIcons; // game-list tile icons; same rule
+        ui::GameArtCache gameArt; // game-list tile icons; same rule
         ui::Snow snow;
         Bank bank;
         std::unique_ptr<SaveSource> save;

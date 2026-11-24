@@ -38,6 +38,14 @@ notice.
 By kwsch and contributors: <https://github.com/kwsch/PKHeX> — GPLv3.
 Format research behind PKSM-Core, and the Pokémon box sprites.
 
+## Game icons — `assets/gameart/`, `romfs/gfx/gameart/`
+From the SteamGridDB "Pokemon Games" icon collection
+(<https://www.steamgriddb.com/collection/12146/icons>), one consistent uploader's set for Red
+through Alpha Sapphire, plus FireRed (icon 5489) from another uploader in the same style.
+Black 2 uses an icon supplied by the project owner. Scaled to 84x84 by
+`tools/convert_gameart.ps1`. Sun, Moon, Ultra Sun and Ultra Moon have no icon in the
+collection and show their name. Artwork is © its respective owners.
+
 ## Trademarks
 Pokémon and all related names and images are trademarks and © of Nintendo, Game Freak and
 Creatures Inc.

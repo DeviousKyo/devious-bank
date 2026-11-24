@@ -50,7 +50,7 @@ namespace db
         constexpr u32 STATUS_FRAMES = 180; // a status message shows for ~3 s, then the hint
 
         // ---- Game select tiles: 4 columns x 2 rows on the top screen. Each tile is an 84x84
-        // square holding the game's own icon at 64x64, with the game's name below.
+        // square filled with the game's icon art, with the game's name below.
         constexpr int CARD_COLS  = 4;
         constexpr int CARD_ROWS  = 2;
         constexpr int COVER      = 84;
@@ -156,7 +156,7 @@ namespace db
         storage.reset();
         save.reset();
         icons.clear();  // icon textures, before citro3d goes away
-        gameIcons.clear(); // game icon textures, same
+        gameArt.clear();   // game icon textures, same
         gfx.fini();     // text buffer, render targets, citro2d, citro3d, gfx
         if (i18nUp)
         {
@@ -217,7 +217,6 @@ namespace db
     {
         progressFrame("Looking for Pokemon saves...");
         // If AM failed to start, the title scan finds nothing and only SD saves are listed.
-        gameIcons.clear(); // icons are cached by list position, which the rescan changes
         saves      = scanSaves();
         listCursor = 0;
     }
@@ -231,7 +230,7 @@ namespace db
         sel.reset();
         ySelecting = false;
         touchStart = -1;
-        gameIcons.clear(); // not shown in the boxes; free them
+        gameArt.clear(); // not shown in the boxes; free them
 
         if (listCursor > 0)
         {
@@ -998,6 +997,7 @@ namespace db
         const int rows     = (entries + CARD_COLS - 1) / CARD_COLS;
         const int curRow   = listCursor / CARD_COLS;
         const int firstRow = std::clamp(curRow - 1, 0, std::max(0, rows - CARD_ROWS));
+        std::unordered_set<std::string> keep;
         for (int r = 0; r < CARD_ROWS; r++)
         {
             for (int c = 0; c < CARD_COLS; c++)
@@ -1009,16 +1009,16 @@ namespace db
                 float x = CARD_X0 + c * (CARD_W + CARD_GX);
                 float y = CARD_Y0 + r * (CARD_H + CARD_GY);
 
-                // Bank tile: a plain square. Game tiles: the game's own icon.
+                // Bank tile: a plain square. Game tiles: the game's icon art.
                 const C2D_Image* icon = nullptr;
-                float iconScale       = 1.0f;
                 std::string label     = "Bank only";
                 if (idx > 0)
                 {
                     const SaveLocation& s = saves[idx - 1];
-                    icon                  = gameIcons.get(idx - 1, s);
-                    iconScale             = GameIconCache::scaleFor(s.iconKind);
-                    label                 = s.game; // where it lives is on the bottom screen
+                    const std::string key = gameArtKeyFor(s.version);
+                    keep.insert(key);
+                    icon  = gameArt.get(key);
+                    label = s.game; // where it lives is on the bottom screen
                 }
 
                 if (isSel)
@@ -1031,12 +1031,12 @@ namespace db
                 gfx.rect(x, y, CARD_W, CARD_H, isSel ? col::CARD_SEL : col::CARD);
                 if (icon)
                 {
-                    constexpr float ICON = 64, PAD = (COVER - ICON) / 2; // centered 64x64
-                    gfx.image(*icon, x + PAD, y + PAD, iconScale);
+                    gfx.image(*icon, x, y, 1.0f); // 84x84, fills the square
                 }
                 else if (idx > 0)
                 {
-                    // No icon (a .sav from the SD card): show the game's name instead.
+                    // No icon for this game (Sun/Moon/Ultra Sun/Ultra Moon aren't in the
+                    // collection): show the game's name instead.
                     gfx.text(x + COVER / 2, y + COVER / 2 - 8, 0.42f, col::TEXT,
                         saves[idx - 1].game, Align::Center, COVER - 6);
                 }
@@ -1044,6 +1044,7 @@ namespace db
                     Align::Center, CARD_W - 4);
             }
         }
+        gameArt.retainOnly(keep); // only the icons on screen stay in memory
 
         if (rows > CARD_ROWS)
         {
@@ -1462,6 +1463,7 @@ namespace db
             "  SciresM, Epicpkmn11",
             "memecrypto - SciresM (FlagBrew fork)",
             "PKHeX - kwsch: format research and box sprites",
+            "Game icons: SteamGridDB 'Pokemon Games' collection",
             "DS cart SPI (modified): PKSM, from TWLSaveTool (TuxSH)",
             "  and savegame-manager (Pokedoc)",
             "",

@@ -143,39 +143,6 @@ namespace db
             return i18n::game(pksm::Language::ENG, sav.version());
         }
 
-        // Reads a 3DS title's HOME Menu icon (the 48x48 "large" icon from its SMDH, stored
-        // in the title's ExeFS as "icon"). The pixels are already in GPU tile order.
-        bool readTitleIcon(FS_MediaType media, uint64_t titleId, std::vector<uint8_t>& out)
-        {
-            constexpr u32 SMDH_SIZE   = 0x36C0;
-            constexpr u32 ICON_OFFSET = 0x24C0;
-            constexpr u32 ICON_SIZE   = 48 * 48 * 2;
-
-            u32 archPath[4]           = {(u32)(titleId & 0xFFFFFFFF), (u32)(titleId >> 32),
-                          (u32)media, 0};
-            static const u32 filePath[5] = {0, 0, 2, 0x6E6F6369 /* "icon" */, 0};
-            const FS_Path arch = {PATH_BINARY, sizeof(archPath), archPath};
-            const FS_Path file = {PATH_BINARY, sizeof(filePath), filePath};
-
-            Handle h = 0;
-            if (R_FAILED(FSUSER_OpenFileDirectly(
-                    &h, ARCHIVE_SAVEDATA_AND_CONTENT, arch, file, FS_OPEN_READ, 0)))
-            {
-                return false;
-            }
-            std::vector<uint8_t> smdh(SMDH_SIZE);
-            u32 read      = 0;
-            const bool ok = R_SUCCEEDED(FSFILE_Read(h, &read, 0, smdh.data(), SMDH_SIZE)) &&
-                            read == SMDH_SIZE && std::memcmp(smdh.data(), "SMDH", 4) == 0;
-            FSFILE_Close(h);
-            if (!ok)
-            {
-                return false;
-            }
-            out.assign(smdh.begin() + ICON_OFFSET, smdh.begin() + ICON_OFFSET + ICON_SIZE);
-            return true;
-        }
-
         // Fills the display fields of a location found by a scan.
         void describe(SaveLocation& loc, const pksm::Sav& sav, const std::string& tag)
         {
@@ -260,12 +227,7 @@ namespace db
                     const bool vc = f <= PkxFormat::PK2;
                     describe(loc, *sav,
                         media == MEDIATYPE_GAME_CARD ? "3DS Cart"
-                                                     : (vc ? "Virtual Console" : "Digital"));
-                    if (readTitleIcon(media, tid, loc.icon))
-                    {
-                        loc.iconKind = IconKind::Smdh48;
-                    }
-                    out.push_back(loc);
+                                                     : (vc ? "Virtual Console" : "Digital"));                    out.push_back(loc);
                     break; // one save per title
                 }
             }
@@ -342,10 +304,6 @@ namespace db
             loc.cart   = cart;
             loc.path   = cart.gameCode; // also names the backup file
             describe(loc, *sav, "DS Cart");
-            if (dscart::readIcon(loc.icon))
-            {
-                loc.iconKind = IconKind::Ds32;
-            }
             out.push_back(loc);
         }
 
