@@ -72,6 +72,7 @@ namespace db
         {
             amUp = true; // without AM, only SD .sav files are listed
         }
+        dscart::start(); // SPI for DS carts; if it fails, DS carts just aren't listed
         if (!gfx.init())
         {
             return false;
@@ -117,6 +118,7 @@ namespace db
             i18n::exit();
             i18nUp = false;
         }
+        dscart::stop();
         if (amUp)
         {
             amExit();
@@ -504,9 +506,11 @@ namespace db
             gfx.text(BOTTOM_W / 2, 70, 0.55f, col::TEXT, "Choose a save", Align::Center);
             gfx.text(BOTTOM_W / 2, 100, 0.42f, col::DIM,
                 "A: open   Y: rescan   X: credits   START: exit", Align::Center);
-            gfx.text(BOTTOM_W / 2, 140, 0.4f, col::DIM, "GBA / DS saves: put .sav files in",
+            gfx.text(BOTTOM_W / 2, 132, 0.4f, col::DIM,
+                "Gen 4/5 DS carts: insert, then press Y", Align::Center);
+            gfx.text(BOTTOM_W / 2, 152, 0.4f, col::DIM, "GBA / emulator saves: put .sav files in",
                 Align::Center);
-            gfx.text(BOTTOM_W / 2, 156, 0.4f, col::DIM, "sdmc:/3ds/DB/saves/", Align::Center);
+            gfx.text(BOTTOM_W / 2, 168, 0.4f, col::DIM, "sdmc:/3ds/DB/saves/", Align::Center);
         }
         else
         {
@@ -713,7 +717,8 @@ namespace db
             "  SciresM, Epicpkmn11",
             "memecrypto - SciresM (FlagBrew fork)",
             "PKHeX - kwsch: format research and box sprites",
-            "  github.com/kwsch/PKHeX",
+            "DS cart SPI (modified): PKSM, from TWLSaveTool (TuxSH)",
+            "  and savegame-manager (Pokedoc)",
             "",
             "Pokemon and all related names are trademarks of",
             "Nintendo, Game Freak and Creatures Inc.",
@@ -725,7 +730,7 @@ namespace db
         {
             gfx.text(10, y, 0.42f, line[0] == ' ' ? col::DIM : col::TEXT, line, Align::Left,
                 TOP_W - 20);
-            y += 15;
+            y += 14; // 14 lines * 14px ends right at the status bar
         }
     }
 

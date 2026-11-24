@@ -266,6 +266,33 @@ namespace db
             }
         }
 
+        void scanDsCart(std::vector<SaveLocation>& out)
+        {
+            dscart::CartInfo cart;
+            std::string err;
+            if (!dscart::detect(cart, err))
+            {
+                return; // no cart, a 3DS cart, or not a Gen 4/5 Pokemon game
+            }
+            std::vector<uint8_t> bytes;
+            if (!dscart::read(cart, bytes, err))
+            {
+                return;
+            }
+            std::shared_ptr<u8[]> buf;
+            auto sav = parse(bytes, buf);
+            if (!sav)
+            {
+                return;
+            }
+            SaveLocation loc;
+            loc.medium = SaveMedium::DsCart;
+            loc.cart   = cart;
+            loc.path   = cart.gameCode; // also names the backup file
+            loc.label  = gameLabel(*sav) + " [DS Cart]";
+            out.push_back(loc);
+        }
+
         bool readLocation(const SaveLocation& loc, std::vector<uint8_t>& out)
         {
             if (loc.medium == SaveMedium::SdFile)
@@ -278,15 +305,29 @@ namespace db
                 out = std::move(*bytes);
                 return true;
             }
+            if (loc.medium == SaveMedium::DsCart)
+            {
+                // Re-identify first: the cart in the slot may not be the one that was scanned.
+                dscart::CartInfo now;
+                std::string err;
+                return dscart::detect(now, err) && now.gameCode == loc.cart.gameCode &&
+                       now.chipType == loc.cart.chipType && dscart::read(now, out, err);
+            }
             Archive arch(loc.media, loc.titleId);
             return arch && archiveRead(arch.get(), loc.path, out);
         }
 
-        bool writeLocation(const SaveLocation& loc, const uint8_t* data, size_t len)
+        // `expected`: what the medium held when last read (DS carts check it before writing).
+        bool writeLocation(const SaveLocation& loc, const uint8_t* data, size_t len,
+            const std::vector<uint8_t>& expected, std::string& err)
         {
             if (loc.medium == SaveMedium::SdFile)
             {
                 return fs::writeFileAtomic(loc.path, data, len);
+            }
+            if (loc.medium == SaveMedium::DsCart)
+            {
+                return dscart::write(loc.cart, data, len, expected, err);
             }
             Archive arch(loc.media, loc.titleId);
             return arch && archiveWrite(arch.get(), loc.path, data, len);
@@ -296,6 +337,7 @@ namespace db
     std::vector<SaveLocation> scanSaves()
     {
         std::vector<SaveLocation> out;
+        scanDsCart(out);
         scanTitles(MEDIATYPE_GAME_CARD, out);
         scanTitles(MEDIATYPE_SD, out);
         scanSdSaves(out);
@@ -312,8 +354,9 @@ namespace db
         }
 
         std::unique_ptr<SaveSource> src(new SaveSource());
-        src->loc  = loc;
-        src->size = bytes.size();
+        src->loc      = loc;
+        src->size     = bytes.size();
+        src->onMedium = bytes;
         src->sav  = parse(bytes, src->buffer);
         if (!src->sav)
         {
@@ -333,8 +376,29 @@ namespace db
             src->roReason = "Backup failed, opened read-only: " + b.error;
         }
 
+        src->party = snapshotParty(*src->sav);
         src->rebuildBoxes();
         return src;
+    }
+
+    SaveSource::PartySnapshot SaveSource::snapshotParty(const pksm::Sav& s)
+    {
+        PartySnapshot p;
+        p.count = s.partyCount();
+        for (u8 i = 0; i < 6; i++)
+        {
+            auto pk = s.pkm(i);
+            if (pk)
+            {
+                auto raw = pk->rawData();
+                p.mons.emplace_back(raw.begin(), raw.end());
+            }
+            else
+            {
+                p.mons.emplace_back();
+            }
+        }
+        return p;
     }
 
     std::string SaveSource::gameName() const
@@ -421,23 +485,54 @@ namespace db
             }
         }
 
+        // Party guard 1: the box writes above must not have touched the party.
+        if (!(snapshotParty(*sav) == party))
+        {
+            roReason = "Party check failed before saving; nothing was written. Reopen the save.";
+            err      = roReason;
+            return false;
+        }
+
         sav->finishEditing(); // checksums, Gen 7 signature, Gen 1/2 box compaction
         const size_t len   = sav->getEntireLengthIncludingFooter();
         const uint32_t crc = fs::crc32(buffer.get(), len);
-        bool ok            = writeLocation(loc, buffer.get(), len);
+
+        // Party guard 2: parse the exact image about to be written, from a separate copy,
+        // and compare its party with the one recorded at load.
+        {
+            std::vector<uint8_t> image(buffer.get(), buffer.get() + len);
+            std::shared_ptr<u8[]> checkBuf;
+            auto check = parse(image, checkBuf);
+            if (!check || !(snapshotParty(*check) == party))
+            {
+                sav->beginEditing();
+                roReason = "Party check failed on the final save image; nothing was written. "
+                           "Reopen the save.";
+                err = roReason;
+                return false;
+            }
+        }
+
+        std::string writeErr;
+        bool ok = writeLocation(loc, buffer.get(), len, onMedium, writeErr);
         if (ok)
         {
             std::vector<uint8_t> check;
             ok = readLocation(loc, check) && check.size() == len &&
                  fs::crc32(check.data(), len) == crc;
-            if (!ok)
+            if (ok)
+            {
+                onMedium = std::move(check);
+            }
+            else
             {
                 err = "Save written but verification failed. Backup: " + backup;
             }
         }
         else
         {
-            err = "Writing the save failed. Backup: " + backup;
+            err = (writeErr.empty() ? std::string("Writing the save failed") : writeErr) +
+                  ". Backup: " + backup;
         }
         sav->beginEditing();
 

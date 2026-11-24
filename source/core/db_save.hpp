@@ -1,13 +1,17 @@
 // Game save access: discovery, load (+ mandatory verified backup) and write-back.
 //
-// Two places a save can come from in this version:
+// Three places a save can come from:
 //   - TitleArchive: a 3DS title's save archive (Gen 6/7 retail carts and digital copies,
 //                   Gen 1/2 Virtual Console). Read/written through FS:USER.
+//   - DsCart:       a Gen 4/5 DS cartridge in the game card slot, over SPI (db_dscart).
 //   - SdFile:       a .sav file in sdmc:/3ds/DB/saves/ (Gen 3 GBA dumps, Gen 4/5 DS saves
 //                   from flashcarts/emulators, or any of the above).
-// Reading DS cartridges directly over SPI is planned but not implemented yet.
+//
+// Party Pokemon are never edited: only box slots are written, and commit() refuses to
+// write a save image whose party differs from the one recorded when it was opened.
 #pragma once
 
+#include "core/db_dscart.hpp"
 #include "core/db_slot.hpp"
 #include "sav/Sav.hpp"
 
@@ -21,6 +25,7 @@ namespace db
     enum class SaveMedium : uint8_t
     {
         TitleArchive,
+        DsCart,
         SdFile,
     };
 
@@ -29,7 +34,8 @@ namespace db
         SaveMedium medium     = SaveMedium::SdFile;
         FS_MediaType media    = MEDIATYPE_SD; // TitleArchive only
         uint64_t titleId      = 0;            // TitleArchive only
-        std::string path;                     // file inside the archive, or full SD path
+        dscart::CartInfo cart;                // DsCart only
+        std::string path;                     // file inside the archive, SD path, or game code
         std::string label;                    // shown in the game list
     };
 
@@ -58,10 +64,23 @@ namespace db
         bool commit(std::string& err);
 
     private:
+        // The party (count + the raw bytes of each party Pokemon) as stored in the save.
+        // Devious Bank never edits the party; commit() refuses to write any image whose
+        // party differs from the one recorded when the save was opened.
+        struct PartySnapshot
+        {
+            unsigned count = 0;
+            std::vector<std::vector<uint8_t>> mons;
+            bool operator==(const PartySnapshot&) const = default;
+        };
+        static PartySnapshot snapshotParty(const pksm::Sav& s);
+
         SaveSource() = default;
         void rebuildBoxes();
+        PartySnapshot party;
 
         SaveLocation loc;
+        std::vector<uint8_t> onMedium; // exact bytes last read from / written to the medium
         std::shared_ptr<u8[]> buffer;
         size_t size = 0;
         std::unique_ptr<pksm::Sav> sav;

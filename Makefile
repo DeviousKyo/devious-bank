@@ -20,6 +20,7 @@ PKSMCORE	:=	lib/PKSM-Core
 
 SOURCES		:=	source \
 				source/core \
+				source/io \
 				source/ui \
 				$(PKSMCORE)/source/i18n \
 				$(PKSMCORE)/source/personal \

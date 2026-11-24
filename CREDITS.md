@@ -23,6 +23,17 @@ By SciresM, FlagBrew fork: <https://github.com/FlagBrew/memecrypto> — GPLv3.
 ## pcg-cpp — `lib/PKSM-Core/pcg-cpp`
 By Melissa O'Neill: <https://github.com/imneme/pcg-cpp> — MIT / Apache-2.0. Not compiled in.
 
+## DS cartridge SPI access — `source/io/spi.hpp`, `source/io/spi.cpp`
+From PKSM (<https://github.com/FlagBrew/PKSM>, `3ds/include/io/spi.hpp`,
+`3ds/source/io/spi.cpp`), Copyright (C) 2016-2022 Bernardo Giordano, Admiral Fish,
+piepie62 — GPLv3 with additional terms 7(b) and 7(c).
+Based on TWLSaveTool, Copyright (C) 2015-2016 TuxSH (GPLv2+), and savegame-manager,
+Copyright (C) Pokedoc 2010 (GPLv2+).
+
+**Modified:** PKSM's logging calls are compiled to no-ops (its logging module is not part of
+this project). The SPI logic is unchanged. Both files carry a "MODIFIED for Devious Bank"
+notice.
+
 ## PKHeX
 By kwsch and contributors: <https://github.com/kwsch/PKHeX> — GPLv3.
 Format research behind PKSM-Core, and the Pokémon box sprites.
