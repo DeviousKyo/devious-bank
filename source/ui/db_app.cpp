@@ -50,7 +50,7 @@ namespace db
         constexpr u32 STATUS_FRAMES = 180; // a status message shows for ~3 s, then the hint
 
         // ---- Game select tiles: 4 columns x 2 rows on the top screen. Each tile is an 84x84
-        // square holding the game's own icon at 64x64, with a 12px source label below.
+        // square holding the game's own icon at 64x64, with the game's name below.
         constexpr int CARD_COLS  = 4;
         constexpr int CARD_ROWS  = 2;
         constexpr int COVER      = 84;
@@ -1018,7 +1018,7 @@ namespace db
                     const SaveLocation& s = saves[idx - 1];
                     icon                  = gameIcons.get(idx - 1, s);
                     iconScale             = GameIconCache::scaleFor(s.iconKind);
-                    label                 = s.tag;
+                    label                 = s.game; // where it lives is on the bottom screen
                 }
 
                 if (isSel)
