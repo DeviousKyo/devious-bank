@@ -158,6 +158,32 @@ namespace db
         return true;
     }
 
+    bool Storage::tradeReplace(
+        const SlotRef& where, const Slot& outgoing, const Slot& incoming, std::string& why)
+    {
+        if (!hasPane(where.pane) || paneReadOnly(where.pane, &why))
+        {
+            if (why.empty()) why = "No save loaded";
+            return false;
+        }
+        Slot& s = at(where);
+        if (s.format != outgoing.format || s.length != outgoing.length ||
+            !std::equal(s.data.begin(), s.data.begin() + s.length, outgoing.data.begin()))
+        {
+            why = "The offered Pokemon is no longer in its slot";
+            return false;
+        }
+        if (!s.movable() || !accepts(where.pane, incoming.format, &why))
+        {
+            if (why.empty()) why = "That slot can't take the received Pokemon";
+            return false;
+        }
+        s       = incoming;
+        s.flags = 0;
+        markDirty(where);
+        return true;
+    }
+
     std::vector<SlotRef> Storage::findEmpty(Pane p, int count, int startBox)
     {
         std::vector<SlotRef> out;

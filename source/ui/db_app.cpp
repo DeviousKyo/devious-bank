@@ -153,6 +153,8 @@ namespace db
     {
         // Drop save/bank objects first (no file handles are held open between operations;
         // every archive/file handle is scoped to a single read or write).
+        tradeSession.reset(); // says goodbye to a trade partner and closes its sockets
+        net::stop();          // SOC service + its buffer
         storage.reset();
         save.reset();
         icons.clear();  // icon textures, before citro3d goes away
@@ -189,8 +191,15 @@ namespace db
             touchPosition touch;
             hidTouchRead(&touch);
 
+            if (tradeSession)
+            {
+                pumpTrade(); // network keeps running under menus and messages too
+            }
+
             switch (state)
             {
+                case State::TradeWait:  inputTradeWait(down, repeat); break;
+                case State::Trade:      inputTrade(down, repeat); break;
                 case State::GameSelect: inputGameSelect(down, repeat); break;
                 case State::BoxView:    inputBoxView(down, repeat, keys, touch); break;
                 case State::Menu:       inputMenu(down, repeat); break;
@@ -338,6 +347,8 @@ namespace db
             menu.push_back({"Back to game list", col::TEXT, MenuAction::Return});
             menu.push_back({"Exit", col::TEXT, MenuAction::Exit});
         }
+        menu.push_back({"Trade over Wi-Fi: host", col::MODE_SELECT, MenuAction::TradeHost});
+        menu.push_back({"Trade over Wi-Fi: join", col::MODE_SELECT, MenuAction::TradeJoin});
         menu.push_back({"Button guide", col::TEXT, MenuAction::Help});
         menu.push_back({"Back", col::DIM, MenuAction::Back});
         menuTitle  = "Menu";
@@ -393,6 +404,12 @@ namespace db
             case MenuAction::Exit:
                 quit = true; // nothing written
                 break;
+            case MenuAction::TradeHost:
+                startTrade(true);
+                break;
+            case MenuAction::TradeJoin:
+                startTrade(false);
+                break;
             case MenuAction::Help:
                 helpReturn = State::BoxView;
                 state      = State::Help;
@@ -400,6 +417,345 @@ namespace db
             case MenuAction::Back:
                 state = State::BoxView;
                 break;
+        }
+    }
+
+    // =====================================================================================
+    // Local Wi-Fi trading
+    // =====================================================================================
+
+    std::string App::trainerName() const
+    {
+        std::string n = save ? save->trainerName() : "";
+        return n.empty() ? std::string("Trainer") : n;
+    }
+
+    void App::startTrade(bool host)
+    {
+        held.reset();
+        group.reset();
+        clearSelection();
+        tradeRef.reset();
+        shownMine.reset();
+        shownTheirs.reset();
+        tradeMineInfo   = ui::Summary{};
+        tradeTheirsInfo = ui::Summary{};
+        peerCursor      = 0;
+
+        progressFrame(host ? "Starting Wi-Fi..." : "Looking for trades on this Wi-Fi...");
+        std::string err;
+        tradeSession = host ? trade::Session::host(trainerName(), err)
+                            : trade::Session::browse(trainerName(), err);
+        if (!tradeSession)
+        {
+            state = State::BoxView;
+            showMessage("Can't trade: " + err, true);
+            return;
+        }
+        // The received Pokemon goes where my offer comes from, so that slot's pane decides
+        // what can be received (the bank takes any generation; a save only its own).
+        tradeSession->setAcceptCheck(
+            [this](const Slot& incoming, std::string& why)
+            {
+                if (!tradeRef) return true;
+                if (storage->paneReadOnly(tradeRef->pane, &why)) return false;
+                return storage->accepts(tradeRef->pane, incoming.format, &why);
+            });
+        state = State::TradeWait;
+    }
+
+    // `message` is taken by value on purpose: callers pass the session's own end reason,
+    // which is destroyed by tradeSession.reset() below.
+    void App::leaveTrade(std::string message, bool error)
+    {
+        if (tradeSession)
+        {
+            tradeSession->leave();
+            tradeSession.reset();
+        }
+        tradeRef.reset();
+        shownMine.reset();
+        shownTheirs.reset();
+        tradeMineInfo   = ui::Summary{};
+        tradeTheirsInfo = ui::Summary{};
+        invalidate();
+        if (state == State::Message && !message.empty())
+        {
+            // Don't replace a message already on screen (e.g. where the trade log is, or
+            // that saving failed): add to it, and return to the boxes afterwards.
+            this->message += "\n\n" + message;
+            messageError  = messageError || error;
+            messageReturn = State::BoxView;
+            return;
+        }
+        state = State::BoxView;
+        if (!message.empty())
+        {
+            showMessage(message, error);
+        }
+    }
+
+    void App::pumpTrade()
+    {
+        tradeSession->update();
+        using Phase = trade::Session::Phase;
+
+        if (tradeSession->phase() == Phase::Committed)
+        {
+            applyTrade();
+            return;
+        }
+        if (tradeSession->phase() == Phase::Ended)
+        {
+            leaveTrade(tradeSession->endReason(), true);
+            return;
+        }
+        // Backstop: a live offer must always match the Pokemon in tradeRef's slot. If it ever
+        // doesn't (and we haven't locked yet), withdraw it before it can be traded.
+        if (const auto& mine = tradeSession->myOffer(); mine && !tradeSession->locked())
+        {
+            const bool intact =
+                tradeRef && storage->at(*tradeRef).format == mine->format &&
+                storage->at(*tradeRef).length == mine->length &&
+                std::equal(mine->data.begin(), mine->data.begin() + mine->length,
+                    storage->at(*tradeRef).data.begin());
+            if (!intact)
+            {
+                tradeSession->withdraw();
+                tradeRef.reset();
+                setStatus("Offer withdrawn: it no longer matched its slot", col::WARN);
+            }
+        }
+        if (tradeSession->phase() == Phase::Trading && state == State::TradeWait)
+        {
+            state = State::Trade;
+            setStatus("Connected to " + tradeSession->partnerName() +
+                          ". Pick a Pokemon and press A to offer it.",
+                col::GOOD);
+        }
+        refreshTradeInfo();
+    }
+
+    void App::refreshTradeInfo()
+    {
+        // Rebuild the two offer summaries only when an offer actually changed.
+        auto same = [](const std::optional<Slot>& a, const std::optional<Slot>& b)
+        {
+            if (a.has_value() != b.has_value()) return false;
+            if (!a) return true;
+            return a->format == b->format && a->length == b->length &&
+                   std::equal(a->data.begin(), a->data.begin() + a->length, b->data.begin());
+        };
+        bool changed = false;
+        if (!same(shownMine, tradeSession->myOffer()))
+        {
+            shownMine     = tradeSession->myOffer();
+            tradeMineInfo = shownMine ? buildSummary(*shownMine) : ui::Summary{};
+            changed       = true;
+        }
+        if (!same(shownTheirs, tradeSession->partnerOffer()))
+        {
+            shownTheirs     = tradeSession->partnerOffer();
+            tradeTheirsInfo = shownTheirs ? buildSummary(*shownTheirs) : ui::Summary{};
+            changed         = true;
+        }
+        if (changed)
+        {
+            summaryValid = false; // re-runs the icon cache trim with the new offer icons
+        }
+    }
+
+    void App::applyTrade()
+    {
+        const std::optional<Slot> outgoing = tradeSession->myOffer();
+        const std::optional<Slot> incoming = tradeSession->partnerOffer();
+        const std::string log              = tradeSession->tradeLogPath();
+        const std::string partner          = tradeSession->partnerName();
+
+        std::string why;
+        bool ok = tradeRef && outgoing && incoming &&
+                  storage->tradeReplace(*tradeRef, *outgoing, *incoming, why);
+        tradeSession->completeCommit();
+        tradeRef.reset();
+        invalidate();
+
+        if (!ok)
+        {
+            // The partner may have completed their side. Nothing is lost: both Pokemon are in
+            // the trade log on this SD card.
+            showMessage("The trade couldn't be applied here: " + why +
+                            "\nBoth Pokemon were saved to " + log,
+                true);
+            return;
+        }
+
+        // Like an in-game trade, a completed trade is saved right away.
+        std::string err;
+        const State keep = state;
+        if (saveAll(err))
+        {
+            state = keep;
+            setStatus("Trade with " + partner + " complete and saved!", col::GOOD);
+        }
+        else
+        {
+            state = keep;
+            showMessage("Traded, but saving failed: " + err +
+                            "\nThe received Pokemon is in your box (unsaved) and both Pokemon "
+                            "are in " + log + ". Use START > Save to try again.",
+                true);
+        }
+    }
+
+    void App::inputTradeWait(u32 down, u32 repeat)
+    {
+        if (!tradeSession)
+        {
+            state = State::BoxView;
+            return;
+        }
+        if (down & KEY_B)
+        {
+            leaveTrade("", false);
+            return;
+        }
+        // Host: nothing to do but wait. Guest: pick a host, or type its IP.
+        if (tradeSession->role() != trade::Session::Role::Guest ||
+            tradeSession->phase() != trade::Session::Phase::Waiting)
+        {
+            return;
+        }
+        const auto& peers = tradeSession->peers();
+        const int n       = (int)peers.size();
+        if (n > 0)
+        {
+            peerCursor = std::clamp(peerCursor, 0, n - 1);
+            if (repeat & KEY_DOWN) peerCursor = (peerCursor + 1) % n;
+            if (repeat & KEY_UP) peerCursor = (peerCursor + n - 1) % n;
+        }
+        std::string ip;
+        if ((down & KEY_A) && n > 0)
+        {
+            ip = peers[peerCursor].ip;
+        }
+        if (down & KEY_Y)
+        {
+            SwkbdState kbd;
+            swkbdInit(&kbd, SWKBD_TYPE_NUMPAD, 2, 15);
+            swkbdSetNumpadKeys(&kbd, '.', 0);
+            swkbdSetHintText(&kbd, "Host's IP address (shown on the host's screen)");
+            char buf[16] = {};
+            if (swkbdInputText(&kbd, buf, sizeof(buf)) == SWKBD_BUTTON_CONFIRM)
+            {
+                ip = buf;
+            }
+        }
+        if (!ip.empty())
+        {
+            std::string err;
+            if (!tradeSession->join(ip, err))
+            {
+                showMessage("Can't connect: " + err, true);
+            }
+        }
+    }
+
+    void App::inputTrade(u32 down, u32 repeat)
+    {
+        if (!tradeSession)
+        {
+            state = State::BoxView;
+            return;
+        }
+        // Moving around the boxes works as usual; nothing can be picked up while trading.
+        int& cur = cursor[paneIdx()];
+        int row = cur / BOX_COLS, colIdx = cur % BOX_COLS;
+        const int before = cur;
+        if (repeat & KEY_UP) row = (row + BOX_ROWS - 1) % BOX_ROWS;
+        if (repeat & KEY_DOWN) row = (row + 1) % BOX_ROWS;
+        if (repeat & KEY_LEFT) colIdx = (colIdx + BOX_COLS - 1) % BOX_COLS;
+        if (repeat & KEY_RIGHT) colIdx = (colIdx + 1) % BOX_COLS;
+        cur = row * BOX_COLS + colIdx;
+        if (cur != before) summaryValid = false;
+        if (repeat & (KEY_L | KEY_ZL)) changeBox(-1);
+        if (repeat & (KEY_R | KEY_ZR)) changeBox(+1);
+        if (down & KEY_SELECT) togglePane();
+
+        if (down & KEY_A)
+        {
+            std::string why;
+            const SlotRef here = cursorRef();
+            const Slot& s      = storage->at(here);
+            if (tradeSession->locked())
+            {
+                setStatus("Locked in - waiting for your partner", col::DIM);
+            }
+            else if (s.empty())
+            {
+                setStatus("Pick a Pokemon to offer", col::DIM);
+            }
+            else if (storage->paneReadOnly(here.pane, &why))
+            {
+                setStatus("Can't trade from here: " + why, col::WARN);
+            }
+            else
+            {
+                // tradeRef must always name the slot of the offer that is live. Set it for the
+                // accept check during offer(); if offer() fails, the previous offer is still
+                // live, so put its slot back (clearing it here could duplicate a Pokemon).
+                const std::optional<SlotRef> previous = tradeRef;
+                tradeRef                              = here;
+                if (tradeSession->offer(s, why))
+                {
+                    setStatus("Offered. Press Y when you're happy with the trade.", col::GOOD);
+                }
+                else
+                {
+                    tradeRef = previous;
+                    setStatus(why, col::WARN);
+                }
+            }
+        }
+        if (down & KEY_Y)
+        {
+            std::string why;
+            // Last check before promising anything: my offer is still in its slot.
+            const auto& mine = tradeSession->myOffer();
+            const bool intact =
+                tradeRef && mine && storage->at(*tradeRef).length == mine->length &&
+                std::equal(mine->data.begin(), mine->data.begin() + mine->length,
+                    storage->at(*tradeRef).data.begin());
+            if (!intact)
+            {
+                setStatus("Offer a Pokemon first (A)", col::WARN);
+            }
+            else if (tradeSession->confirm(why))
+            {
+                setStatus("Confirmed - waiting for " + tradeSession->partnerName(),
+                    col::MODE_SELECT);
+            }
+            else
+            {
+                setStatus(why, col::WARN);
+            }
+        }
+        if (down & KEY_B)
+        {
+            if (tradeSession->locked())
+            {
+                setStatus("Locked in - the trade finishes when your partner confirms",
+                    col::DIM);
+            }
+            else if (tradeSession->myOffer())
+            {
+                tradeSession->withdraw();
+                tradeRef.reset();
+                setStatus("Offer withdrawn", col::DIM);
+            }
+            else
+            {
+                leaveTrade("You left the trade.", false);
+            }
         }
     }
 
@@ -903,6 +1259,8 @@ namespace db
             std::unordered_set<int> keep;
             for (const CellInfo& c : cells) keep.insert(c.iconKey);
             keep.insert(summary.iconKey);
+            keep.insert(tradeMineInfo.iconKey);   // trade offers shown on the top screen
+            keep.insert(tradeTheirsInfo.iconKey);
             if (held) keep.insert(heldIcon);
             if (group) keep.insert(group->iconKeys.begin(), group->iconKeys.end());
             icons.retainOnly(keep);
@@ -958,6 +1316,17 @@ namespace db
             snow.drawTop(gfx);
             if (state == State::Credits) renderCredits();
             else renderGameListTop();
+        }
+        else if (state == State::TradeWait ||
+                 (state == State::Message && messageReturn == State::TradeWait))
+        {
+            renderTradeWait();
+        }
+        else if (state == State::Trade ||
+                 (state == State::Message && messageReturn == State::Trade))
+        {
+            renderTradeTop();
+            renderStatusBar();
         }
         else
         {
@@ -1176,7 +1545,13 @@ namespace db
 
         // Context hint for the current mode.
         std::string hint;
-        if (group)
+        if (state == State::Trade && tradeSession)
+            hint = tradeSession->locked()
+                       ? "Locked in - waiting for your partner to confirm"
+                       : (tradeSession->myOffer()
+                              ? "A offer a different one  Y confirm trade  B withdraw offer"
+                              : "A offer the Pokemon under the cursor  B leave the trade");
+        else if (group)
             hint = "Holding " + std::to_string(group->slots.size()) +
                    ": A place (cursor = top-left)  X send  B put back";
         else if (held)
@@ -1262,7 +1637,11 @@ namespace db
             const bool marked = selectionHere() && sel->marked[i];
             const bool hover  = i == cur;
 
-            // Outline drawn behind the tile so it reads as a rounded border.
+            const bool offered = tradeRef && tradeRef->pane == pane && tradeRef->box == bi &&
+                                 tradeRef->slot == i;
+            // Outline drawn behind the tile so it reads as a border.
+            if (offered)
+                gfx.rect(x - 3, y - 3, TILE_W + 6, TILE_H + 6, col::MODE_GROUP); // on offer
             if (hover)
                 gfx.rect(x - 2, y - 2, TILE_W + 4, TILE_H + 4, modeColor());
             else if (preview[i])
@@ -1357,6 +1736,132 @@ namespace db
         }
     }
 
+    // ---- Trade screens (top) ------------------------------------------------------------
+
+    void App::renderTradeWait()
+    {
+        gfx.gradient(0, 0, TOP_W, SCREEN_H, col::BG, rgba(0x18, 0x19, 0x22));
+        gfx.rect(0, 0, TOP_W, TOP_HEADER_H, col::PANEL);
+        gfx.text(8, 2, 0.5f, col::TEXT, "Local Wi-Fi trade");
+        if (!tradeSession)
+        {
+            return;
+        }
+        const bool host = tradeSession->role() == trade::Session::Role::Host;
+        const auto phase = tradeSession->phase();
+        const std::string ip = tradeSession->localIp();
+
+        if (phase == trade::Session::Phase::Connecting)
+        {
+            gfx.text(TOP_W / 2, 100, 0.55f, col::TEXT, "Connecting...", Align::Center);
+        }
+        else if (host)
+        {
+            gfx.text(TOP_W / 2, 50, 0.6f, col::TEXT, "Waiting for a partner...", Align::Center);
+            gfx.text(TOP_W / 2, 84, 0.45f, col::DIM,
+                "On the other 3DS: Devious Bank > START > Trade over Wi-Fi: join",
+                Align::Center, TOP_W - 20);
+            gfx.text(TOP_W / 2, 120, 0.45f, col::DIM, "If it doesn't show up there, type this IP:",
+                Align::Center);
+            gfx.text(TOP_W / 2, 140, 0.8f, col::CURSOR, ip, Align::Center);
+        }
+        else
+        {
+            const auto& peers = tradeSession->peers();
+            gfx.text(12, 26, 0.48f, col::TEXT, "Trades on this Wi-Fi:");
+            if (peers.empty())
+            {
+                gfx.text(TOP_W / 2, 90, 0.45f, col::DIM, "Looking... (the other 3DS must be hosting)",
+                    Align::Center, TOP_W - 20);
+            }
+            for (size_t i = 0; i < peers.size() && i < 7; i++)
+            {
+                const float y = 48 + i * 22.0f;
+                if ((int)i == peerCursor)
+                {
+                    gfx.rect(10, y - 2, TOP_W - 20, 20, col::CARD_SEL);
+                    gfx.rect(10, y - 2, 4, 20, col::CURSOR);
+                }
+                gfx.text(22, y, 0.48f, col::TEXT,
+                    (peers[i].name.empty() ? std::string("Trainer") : peers[i].name), Align::Left,
+                    220);
+                gfx.text(TOP_W - 20, y + 1, 0.42f, col::DIM, peers[i].ip, Align::Right);
+            }
+        }
+
+        // Button hints
+        float x = 12;
+        const float y = STATUS_Y + 1;
+        gfx.rect(0, STATUS_Y, TOP_W, SCREEN_H - STATUS_Y, col::PANEL);
+        if (!host && phase == trade::Session::Phase::Waiting)
+        {
+            x += drawButton(x, y, "A") + 4;
+            gfx.text(x, y + 1, 0.4f, col::TEXT, "Join");
+            x += 40;
+            x += drawButton(x, y, "Y") + 4;
+            gfx.text(x, y + 1, 0.4f, col::TEXT, "Type an IP");
+            x += 80;
+        }
+        x += drawButton(x, y, "B") + 4;
+        gfx.text(x, y + 1, 0.4f, col::TEXT, "Cancel");
+        gfx.text(TOP_W - 8, y + 1, 0.38f, col::DIM, "You: " + (ip.empty() ? "no Wi-Fi" : ip),
+            Align::Right);
+    }
+
+    void App::renderTradeTop()
+    {
+        gfx.gradient(0, 0, TOP_W, SCREEN_H, col::BG, rgba(0x18, 0x19, 0x22));
+        gfx.rect(0, 0, TOP_W, TOP_HEADER_H, col::PANEL);
+        const std::string partner = tradeSession ? tradeSession->partnerName() : "";
+        gfx.text(8, 2, 0.5f, col::TEXT, "Trading with " + partner, Align::Left, 300);
+        if (!tradeSession)
+        {
+            return;
+        }
+
+        // Two panels: your offer | partner's offer.
+        auto panel = [&](float x, const char* heading, const ui::Summary& s, bool confirmed,
+                         const std::string& problem)
+        {
+            const float w = TOP_W / 2 - 12;
+            gfx.rect(x, 26, w, 190, col::CARD);
+            gfx.rect(x, 26, w, 18, confirmed ? col::GOOD : col::PANEL);
+            gfx.text(x + 6, 27, 0.42f, col::TEXT, heading, Align::Left, w - 70);
+            if (confirmed)
+            {
+                gfx.text(x + w - 6, 27, 0.42f, col::TEXT, "Confirmed", Align::Right);
+            }
+            if (!s.present)
+            {
+                gfx.text(x + w / 2, 110, 0.45f, col::DIM, "No Pokemon offered yet",
+                    Align::Center, w - 10);
+                return;
+            }
+            if (const C2D_Image* img = icons.get(s.iconKey))
+            {
+                gfx.ellipse(x + w / 2 - 24, 104, 48, 9, col::SHADOW);
+                gfx.image(*img, x + (w - 64) / 2, 48, 1.0f);
+            }
+            gfx.text(x + w / 2, 112, 0.46f, col::TEXT, s.title, Align::Center, w - 10);
+            float y = 132;
+            for (size_t i = 0; i < s.left.size() && i < 5; i++)
+            {
+                gfx.text(x + 6, y, 0.36f, col::DIM, s.left[i], Align::Left, w - 12);
+                y += 13;
+            }
+            if (!problem.empty())
+            {
+                gfx.text(x + 6, 200, 0.36f, col::WARN, problem, Align::Left, w - 12);
+            }
+        };
+        panel(8, "You offer", tradeMineInfo, tradeSession->myConfirmed(), "");
+        panel(TOP_W / 2 + 4, (partner + " offers").c_str(), tradeTheirsInfo,
+            tradeSession->partnerConfirmed(),
+            tradeSession->partnerOffer() && !tradeSession->partnerOfferOk()
+                ? "Can't receive: " + tradeSession->partnerOfferProblem()
+                : "");
+    }
+
     // ---- Overlays ------------------------------------------------------------------------
 
     void App::renderMenu()
@@ -1395,7 +1900,7 @@ namespace db
             {"B", nullptr, "Put back / clear selection / back to game list"},
             {"L", "R", "Previous / next box"},
             {"SELECT", nullptr, "Switch between Save and Bank"},
-            {"START", nullptr, "Menu: game list, save, exit, this guide"},
+            {"START", nullptr, "Menu: game list, save, Wi-Fi trade, guide"},
         };
 
         gfx.rect(0, 0, TOP_W, SCREEN_H, col::OVERLAY);

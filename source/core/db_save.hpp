@@ -56,6 +56,7 @@ namespace db
         [[nodiscard]] const SaveLocation& location() const { return loc; }
         [[nodiscard]] PkxFormat format() const { return fmt; }
         [[nodiscard]] std::string gameName() const;
+        [[nodiscard]] std::string trainerName() const { return sav ? sav->otName() : ""; }
         [[nodiscard]] int boxCount() const { return (int)boxes.size(); }
         [[nodiscard]] Box& box(int i) { return boxes[i]; }
         [[nodiscard]] bool readOnly() const { return !roReason.empty(); }

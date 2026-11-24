@@ -51,6 +51,11 @@ namespace db
         bool moveGroup(const std::vector<SlotRef>& from, const std::vector<SlotRef>& to,
             std::string& why);
 
+        // Completes a trade on this side: the Pokemon at `where` must still be exactly
+        // `outgoing` (what was offered), and is replaced by `incoming`. All checks first.
+        bool tradeReplace(const SlotRef& where, const Slot& outgoing, const Slot& incoming,
+            std::string& why);
+
         // Up to `count` empty, writable slots in a pane, scanning from `startBox` and
         // wrapping around. Returns fewer if the pane doesn't have room.
         [[nodiscard]] std::vector<SlotRef> findEmpty(Pane p, int count, int startBox);

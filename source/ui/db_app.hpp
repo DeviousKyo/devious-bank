@@ -14,6 +14,9 @@
 //   Help: the button guide (shown automatically the first time a box opens)
 //   Message: modal text, A/B returns to the previous state
 //   Credits (X on GameSelect): attributions required by the GPLv3 7b terms
+//   TradeWait / Trade (START menu -> Trade): local Wi-Fi trading with another system
+//     running Devious Bank. A offer the Pokemon under the cursor, Y confirm, B withdraw /
+//     leave. Both must confirm; then the Pokemon swap and both sides save.
 //
 // Cursor color shows the mode: yellow pointing, cyan selecting, green holding one
 // Pokemon, pink holding a group.
@@ -22,6 +25,7 @@
 #include "core/db_bank.hpp"
 #include "core/db_save.hpp"
 #include "core/db_storage.hpp"
+#include "core/db_trade.hpp"
 #include "ui/db_gameart.hpp"
 #include "ui/db_gfx.hpp"
 #include "ui/db_icons.hpp"
@@ -52,6 +56,8 @@ namespace db
             Help,
             Message,
             Credits,
+            TradeWait, // hosting (waiting) or browsing for hosts / connecting
+            Trade,     // connected: offer, confirm, receive
         };
 
         // A rectangle of slots in one box, made with Y+move or a stylus drag.
@@ -82,6 +88,8 @@ namespace db
             SaveExit,
             ExitNoSave,
             Exit,
+            TradeHost, // local Wi-Fi trade: wait for a partner
+            TradeJoin, // local Wi-Fi trade: find a host
             Help,
             Back,
         };
@@ -104,6 +112,18 @@ namespace db
         // Closes the open save and shows the game list. `discard` also throws away unsaved
         // bank changes by reloading the bank file.
         void returnToGameList(bool discard);
+
+        // ---- local Wi-Fi trading
+        void startTrade(bool host);
+        void inputTradeWait(u32 down, u32 repeat);
+        void inputTrade(u32 down, u32 repeat);
+        void pumpTrade();          // per-frame network + protocol, handles end/commit
+        void applyTrade();         // called when both sides committed
+        void leaveTrade(std::string message, bool error);
+        void refreshTradeInfo();
+        void renderTradeWait();
+        void renderTradeTop();
+        [[nodiscard]] std::string trainerName() const;
 
         // ---- input
         void inputGameSelect(u32 down, u32 repeat);
@@ -187,6 +207,14 @@ namespace db
         u32 statusFrame = 0; // when the status was set; it fades back to the hint
         bool quit       = false;
         u32 frame       = 0; // animation clock
+
+        // Trade session (null when not trading), where my offer comes from, browse cursor,
+        // and cached display info for both offers.
+        std::unique_ptr<trade::Session> tradeSession;
+        std::optional<SlotRef> tradeRef;
+        int peerCursor = 0;
+        std::optional<Slot> shownMine, shownTheirs;
+        ui::Summary tradeMineInfo, tradeTheirsInfo;
 
         // Display caches: parsing 30 Pokemon every frame is wasteful on Old 3DS.
         bool cellsValid = false;
