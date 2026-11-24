@@ -19,8 +19,8 @@
 
 namespace db::ui
 {
-    // Icon key for a Gen 1-7 game ("D", "HG", ...); "" if unknown. A key with no file
-    // (Sun, Moon, Ultra Sun, Ultra Moon: not in the collection) loads as null.
+    // Icon key for a Gen 1-7 game ("D", "HG", ...); "" if unknown. A key whose file is
+    // missing loads as null and the tile shows the game's name.
     std::string gameArtKeyFor(pksm::GameVersion v);
 
     class GameArtCache

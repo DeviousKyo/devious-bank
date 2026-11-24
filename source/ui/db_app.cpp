@@ -1035,8 +1035,7 @@ namespace db
                 }
                 else if (idx > 0)
                 {
-                    // No icon for this game (Sun/Moon/Ultra Sun/Ultra Moon aren't in the
-                    // collection): show the game's name instead.
+                    // No icon file for this game: show the game's name instead.
                     gfx.text(x + COVER / 2, y + COVER / 2 - 8, 0.42f, col::TEXT,
                         saves[idx - 1].game, Align::Center, COVER - 6);
                 }
