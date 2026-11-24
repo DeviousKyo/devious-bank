@@ -1,5 +1,6 @@
 #include "core/db_storage.hpp"
 
+#include <algorithm>
 #include <utility>
 
 namespace db
@@ -84,6 +85,96 @@ namespace db
         markDirty(a);
         markDirty(b);
         return true;
+    }
+
+    bool Storage::moveGroup(
+        const std::vector<SlotRef>& from, const std::vector<SlotRef>& to, std::string& why)
+    {
+        if (from.size() != to.size() || from.empty())
+        {
+            why = "Nothing to move";
+            return false;
+        }
+        auto contains = [](const std::vector<SlotRef>& v, const SlotRef& r)
+        { return std::find(v.begin(), v.end(), r) != v.end(); };
+
+        // ---- validate everything before touching anything
+        for (size_t i = 0; i < from.size(); i++)
+        {
+            const SlotRef& a = from[i];
+            const SlotRef& b = to[i];
+            if (!hasPane(a.pane) || !hasPane(b.pane))
+            {
+                why = "No save loaded";
+                return false;
+            }
+            if (paneReadOnly(a.pane, &why) || paneReadOnly(b.pane, &why))
+            {
+                return false;
+            }
+            for (size_t j = 0; j < i; j++)
+            {
+                if (from[j] == a || to[j] == b)
+                {
+                    why = "Internal error: duplicate slot in group";
+                    return false;
+                }
+            }
+            const Slot& src = at(a);
+            const Slot& dst = at(b);
+            if (!src.movable())
+            {
+                why = "A Pokemon in the group is locked or damaged";
+                return false;
+            }
+            if (!dst.writable() || (!dst.empty() && !contains(from, b)))
+            {
+                why = "Not enough empty spots there";
+                return false;
+            }
+            if (!accepts(b.pane, src.format, &why))
+            {
+                return false;
+            }
+        }
+
+        // ---- copy out, clear the sources, then place: no Pokemon is ever in two slots
+        std::vector<Slot> moving;
+        moving.reserve(from.size());
+        for (const SlotRef& a : from)
+        {
+            moving.push_back(at(a));
+        }
+        for (const SlotRef& a : from)
+        {
+            at(a) = Slot{};
+            markDirty(a);
+        }
+        for (size_t i = 0; i < to.size(); i++)
+        {
+            at(to[i]) = moving[i];
+            markDirty(to[i]);
+        }
+        return true;
+    }
+
+    std::vector<SlotRef> Storage::findEmpty(Pane p, int count, int startBox)
+    {
+        std::vector<SlotRef> out;
+        const int boxes = boxCount(p);
+        for (int n = 0; n < boxes && (int)out.size() < count; n++)
+        {
+            const int b = (startBox + n) % boxes;
+            for (int s = 0; s < BOX_SLOTS && (int)out.size() < count; s++)
+            {
+                const Slot& slot = box(p, b).slots[s];
+                if (slot.empty() && slot.writable())
+                {
+                    out.push_back(SlotRef{p, b, s});
+                }
+            }
+        }
+        return out;
     }
 
     void Storage::markDirty(const SlotRef& r)

@@ -4,6 +4,8 @@
 #include "utils/i18n.hpp"
 
 #include <algorithm>
+#include <cmath>
+#include <cstring>
 #include <unordered_set>
 
 namespace db
@@ -12,18 +14,50 @@ namespace db
 
     namespace
     {
-        // Bottom-screen grid geometry (320x240): 6x5 cells of 48x40 under a 26px header.
-        constexpr int HEADER_H = 26;
-        constexpr int GRID_X   = 16;
-        constexpr int GRID_Y   = 30;
-        constexpr int CELL_W   = 48;
-        constexpr int CELL_H   = 40;
-        constexpr float ICON_SCALE = 0.66f;
+        // ---- Bottom screen box grid (320x240): 6x5 equal tiles in a centered tray.
+        constexpr int HEADER_H = 28;
+        constexpr int TILE_W   = 40;
+        constexpr int TILE_H   = 34;
+        constexpr int GAP      = 6;
+        constexpr int PITCH_X  = TILE_W + GAP;
+        constexpr int PITCH_Y  = TILE_H + GAP;
+        constexpr int GRID_W   = BOX_COLS * TILE_W + (BOX_COLS - 1) * GAP; // 270
+        constexpr int GRID_H   = BOX_ROWS * TILE_H + (BOX_ROWS - 1) * GAP; // 194
+        constexpr int GRID_X   = (BOTTOM_W - GRID_W) / 2;                  // 25: equal side margins
+        constexpr int GRID_Y   = 36;
+        constexpr float ICON_SCALE  = 0.60f; // 64x56 -> 38x34
+        constexpr float RAISE_SCALE = 0.66f; // hovered / carried sprite, slightly larger
 
-        // Top-screen layout (400x240).
+        int tileX(int i) { return GRID_X + (i % BOX_COLS) * PITCH_X; }
+        int tileY(int i) { return GRID_Y + (i / BOX_COLS) * PITCH_Y; }
+
+        // Touch -> slot index. Gaps belong to the nearest tile so the stylus never misses.
+        int cellAt(const touchPosition& t)
+        {
+            const int rx = t.px - GRID_X + GAP / 2;
+            const int ry = t.py - GRID_Y + GAP / 2;
+            if (rx < 0 || ry < 0)
+            {
+                return -1;
+            }
+            const int c = rx / PITCH_X, r = ry / PITCH_Y;
+            return (c < BOX_COLS && r < BOX_ROWS) ? r * BOX_COLS + c : -1;
+        }
+
+        // ---- Top screen
         constexpr int TOP_HEADER_H = 20;
         constexpr int STATUS_Y     = 222;
-        constexpr int LIST_ROWS    = 11;
+        constexpr u32 STATUS_FRAMES = 180; // a status message shows for ~3 s, then the hint
+
+        // ---- Game select tiles: 2 columns x 3 rows of cards on the top screen.
+        constexpr int CARD_COLS = 2;
+        constexpr int CARD_ROWS = 3;
+        constexpr int CARD_W    = 184;
+        constexpr int CARD_H    = 54;
+        constexpr int CARD_GX   = 12;
+        constexpr int CARD_GY   = 10;
+        constexpr int CARD_X0   = (TOP_W - CARD_COLS * CARD_W - CARD_GX) / 2;
+        constexpr int CARD_Y0   = 38;
 
         std::vector<std::string> wrap(const std::string& text, size_t width)
         {
@@ -55,6 +89,13 @@ namespace db
             if (!line.empty()) out.push_back(line);
             return out;
         }
+
+        const char* paneName(Pane p) { return p == Pane::Save ? "Save" : "Bank"; }
+    }
+
+    int App::Selection::count() const
+    {
+        return (int)std::count(marked.begin(), marked.end(), true);
     }
 
     // =====================================================================================
@@ -140,15 +181,19 @@ namespace db
             hidScanInput();
             const u32 down   = hidKeysDown();
             const u32 repeat = hidKeysDownRepeat();
+            const u32 keys   = hidKeysHeld();
             touchPosition touch;
             hidTouchRead(&touch);
 
             switch (state)
             {
-                case State::GameSelect:  inputGameSelect(down, repeat); break;
-                case State::BoxView:     inputBoxView(down, repeat, touch); break;
-                case State::ConfirmExit: inputConfirmExit(down); break;
-                case State::Message:     inputMessage(down); break;
+                case State::GameSelect: inputGameSelect(down, repeat); break;
+                case State::BoxView:    inputBoxView(down, repeat, keys, touch); break;
+                case State::Menu:       inputMenu(down, repeat); break;
+                case State::Message:    inputMessage(down); break;
+                case State::Help:
+                    if (down & (KEY_A | KEY_B | KEY_START)) state = helpReturn;
+                    break;
                 case State::Credits:
                     if (down & (KEY_B | KEY_A | KEY_X)) state = State::GameSelect;
                     break;
@@ -177,6 +222,10 @@ namespace db
         storage.reset();
         save.reset();
         held.reset();
+        group.reset();
+        sel.reset();
+        ySelecting = false;
+        touchStart = -1;
 
         if (listCursor > 0)
         {
@@ -199,14 +248,20 @@ namespace db
         state     = State::BoxView;
         invalidate();
 
-        if (save && save->readOnly())
-        {
-            showMessage(save->readOnlyReason(), true);
-            messageReturn = State::BoxView;
-        }
-        else if (save)
+        if (save && !save->readOnly())
         {
             setStatus("Backup: " + save->backupPath(), col::GOOD);
+        }
+        // First box of the session: show the button guide so nobody starts out lost.
+        if (!helpShown)
+        {
+            helpShown  = true;
+            helpReturn = State::BoxView;
+            state      = State::Help;
+        }
+        if (save && save->readOnly())
+        {
+            showMessage(save->readOnlyReason(), true); // returns to the guide, then the box
         }
     }
 
@@ -244,12 +299,14 @@ namespace db
     {
         status      = text;
         statusColor = color;
+        statusFrame = frame;
     }
 
     void App::progressFrame(const std::string& text)
     {
         gfx.beginFrame();
         gfx.drawTop();
+        snow.drawTop(gfx);
         int y = 100;
         for (const auto& line : wrap(text, 48))
         {
@@ -257,7 +314,61 @@ namespace db
             y += 20;
         }
         gfx.drawBottom();
+        snow.drawBottom(gfx);
         gfx.endFrame();
+    }
+
+    void App::openMenu()
+    {
+        menu.clear();
+        if (storage && storage->dirty())
+        {
+            menu.push_back({"Save everything and exit", col::GOOD, MenuAction::SaveExit});
+            menu.push_back({"Exit WITHOUT saving", col::WARN, MenuAction::ExitNoSave});
+        }
+        else
+        {
+            menu.push_back({"Exit", col::TEXT, MenuAction::Exit});
+        }
+        menu.push_back({"Button guide", col::TEXT, MenuAction::Help});
+        menu.push_back({"Back", col::DIM, MenuAction::Back});
+        menuCursor = 0;
+        state      = State::Menu;
+    }
+
+    void App::runMenuAction(MenuAction a)
+    {
+        switch (a)
+        {
+            case MenuAction::SaveExit:
+            {
+                std::string err;
+                if (saveAll(err))
+                {
+                    quit = true;
+                }
+                else
+                {
+                    state = State::BoxView;
+                    showMessage("Save failed: " + err +
+                                    "\nNothing was lost: your moves are still here and the "
+                                    "backups are in sdmc:/3ds/DB/backups/",
+                        true);
+                }
+                break;
+            }
+            case MenuAction::ExitNoSave:
+            case MenuAction::Exit:
+                quit = true; // nothing written
+                break;
+            case MenuAction::Help:
+                helpReturn = State::BoxView;
+                state      = State::Help;
+                break;
+            case MenuAction::Back:
+                state = State::BoxView;
+                break;
+        }
     }
 
     // =====================================================================================
@@ -267,17 +378,22 @@ namespace db
     void App::inputGameSelect(u32 down, u32 repeat)
     {
         const int entries = (int)saves.size() + 1; // entry 0 = bank only
-        if (repeat & KEY_DOWN) listCursor = (listCursor + 1) % entries;
-        if (repeat & KEY_UP) listCursor = (listCursor + entries - 1) % entries;
-        if (repeat & KEY_RIGHT) listCursor = std::min(entries - 1, listCursor + LIST_ROWS);
-        if (repeat & KEY_LEFT) listCursor = std::max(0, listCursor - LIST_ROWS);
+        int row = listCursor / CARD_COLS, colIdx = listCursor % CARD_COLS;
+        const int rows = (entries + CARD_COLS - 1) / CARD_COLS;
+
+        if (repeat & KEY_DOWN) row = std::min(rows - 1, row + 1);
+        if (repeat & KEY_UP) row = std::max(0, row - 1);
+        if (repeat & KEY_RIGHT) colIdx = std::min(CARD_COLS - 1, colIdx + 1);
+        if (repeat & KEY_LEFT) colIdx = std::max(0, colIdx - 1);
+        listCursor = std::min(entries - 1, row * CARD_COLS + colIdx);
+
         if (down & KEY_A) openSelected();
         if (down & KEY_Y) scan();
         if (down & KEY_X) state = State::Credits;
         if (down & KEY_START) quit = true;
     }
 
-    void App::inputBoxView(u32 down, u32 repeat, const touchPosition& touch)
+    void App::inputBoxView(u32 down, u32 repeat, u32 keys, const touchPosition& touch)
     {
         int& cur = cursor[paneIdx()];
         int row = cur / BOX_COLS, colIdx = cur % BOX_COLS;
@@ -288,74 +404,325 @@ namespace db
         if (repeat & KEY_LEFT) colIdx = (colIdx + BOX_COLS - 1) % BOX_COLS;
         if (repeat & KEY_RIGHT) colIdx = (colIdx + 1) % BOX_COLS;
         cur = row * BOX_COLS + colIdx;
-        if (cur != before) summaryValid = false;
+        const bool moved = cur != before;
+        if (moved) summaryValid = false;
+
+        // ---- Y + move: drag-select a rectangle
+        if (down & KEY_Y)
+        {
+            if (carrying())
+            {
+                setStatus("Put down what you're holding first (A to place, B to cancel)",
+                    col::WARN);
+            }
+            else
+            {
+                ySelecting = true;
+                selAnchor  = cur;
+                setSelectionRect(cur, cur);
+            }
+        }
+        if (ySelecting)
+        {
+            if (keys & KEY_Y)
+            {
+                if (moved) setSelectionRect(selAnchor, cur);
+            }
+            else
+            {
+                ySelecting = false; // released: the selection stays until used or cleared
+            }
+        }
 
         if (repeat & (KEY_L | KEY_ZL)) changeBox(-1);
         if (repeat & (KEY_R | KEY_ZR)) changeBox(+1);
         if (down & KEY_SELECT) togglePane();
         if (down & KEY_A) pressA();
-        if ((down & KEY_B) && held)
-        {
-            held.reset();
-            invalidate();
-            setStatus("Cancelled", col::DIM);
-        }
+        if (down & KEY_B) cancel();
+        if (down & KEY_X) sendToOtherSide();
         if (down & KEY_START)
         {
-            if (storage->dirty()) state = State::ConfirmExit;
-            else quit = true;
+            openMenu();
+            return;
         }
 
+        // ---- Stylus: tap = A, drag = select (or carry, then drop on release)
         if (down & KEY_TOUCH)
         {
-            const int x = touch.px, y = touch.py;
-            if (y < HEADER_H)
+            if (touch.py < HEADER_H)
             {
-                if (x < 48) changeBox(-1);
-                else if (x > BOTTOM_W - 48) changeBox(+1);
+                if (touch.px < 44) changeBox(-1);
+                else if (touch.px > BOTTOM_W - 44) changeBox(+1);
                 else togglePane();
             }
-            else if (x >= GRID_X && x < GRID_X + BOX_COLS * CELL_W && y >= GRID_Y &&
-                     y < GRID_Y + BOX_ROWS * CELL_H)
+            else if (int c = cellAt(touch); c >= 0)
             {
-                cur          = ((y - GRID_Y) / CELL_H) * BOX_COLS + (x - GRID_X) / CELL_W;
+                touchStart   = c;
+                touchDragged = false;
+                cur          = c;
                 summaryValid = false;
+            }
+        }
+        else if ((keys & KEY_TOUCH) && touchStart >= 0)
+        {
+            const int c = cellAt(touch);
+            if (c >= 0 && c != cur)
+            {
+                cur          = c;
+                summaryValid = false;
+                touchDragged = true;
+                if (!carrying())
+                {
+                    setSelectionRect(touchStart, c);
+                }
+            }
+        }
+        else if (!(keys & KEY_TOUCH) && touchStart >= 0)
+        {
+            // Released. Carrying: drop here. A plain tap: same as A. A drag that made a
+            // selection: keep it, so A / X / another tap can act on it.
+            if (carrying() || !touchDragged)
+            {
                 pressA();
             }
+            touchStart   = -1;
+            touchDragged = false;
+        }
+    }
+
+    void App::inputMenu(u32 down, u32 repeat)
+    {
+        const int n = (int)menu.size();
+        if (repeat & KEY_DOWN) menuCursor = (menuCursor + 1) % n;
+        if (repeat & KEY_UP) menuCursor = (menuCursor + n - 1) % n;
+        if (down & KEY_A) runMenuAction(menu[menuCursor].action);
+        else if (down & (KEY_B | KEY_START)) state = State::BoxView;
+    }
+
+    void App::inputMessage(u32 down)
+    {
+        if (down & (KEY_A | KEY_B))
+        {
+            state = messageReturn;
         }
     }
 
     void App::pressA()
     {
-        const SlotRef here = cursorRef();
-        if (!held)
+        if (group)
         {
-            const Slot& s = storage->at(here);
-            if (s.empty())
-            {
-                return;
-            }
-            if (!s.movable())
-            {
-                setStatus("This slot is damaged/locked and can't be moved", col::WARN);
-                return;
-            }
-            held = here;
-            invalidate();
-            setStatus("Holding - A to place, B to cancel", col::CURSOR);
+            placeGroup();
             return;
         }
 
-        std::string why;
-        if (storage->swap(*held, here, why))
+        const SlotRef here = cursorRef();
+        if (held)
         {
-            held.reset();
+            std::string why;
+            if (storage->swap(*held, here, why))
+            {
+                held.reset();
+                invalidate();
+                setStatus("Moved (not saved yet)", col::GOOD);
+            }
+            else
+            {
+                setStatus(why, col::WARN);
+            }
+            return;
+        }
+
+        if (selectionHere() && sel->marked[here.slot])
+        {
+            pickUpSelection();
+            return;
+        }
+        clearSelection(); // pressing outside a selection drops it
+
+        const Slot& s = storage->at(here);
+        if (s.empty())
+        {
+            return;
+        }
+        if (!s.movable())
+        {
+            setStatus("This slot is damaged/locked and can't be moved", col::WARN);
+            return;
+        }
+        held     = here;
+        heldIcon = cells[here.slot].iconKey;
+        invalidate();
+        setStatus("Holding - A to place, X to send, B to put back", col::MODE_HOLD);
+    }
+
+    void App::pickUpSelection()
+    {
+        Group g;
+        g.pane   = pane;
+        g.box    = boxIdx[paneIdx()];
+        g.minRow = BOX_ROWS;
+        g.minCol = BOX_COLS;
+        for (int i = 0; i < BOX_SLOTS; i++)
+        {
+            if (!sel->marked[i])
+            {
+                continue;
+            }
+            const Slot& s = storage->box(g.pane, g.box).slots[i];
+            if (s.empty())
+            {
+                continue;
+            }
+            if (!s.movable())
+            {
+                setStatus("The selection has a damaged/locked Pokemon", col::WARN);
+                return;
+            }
+            g.slots.push_back(i);
+            g.iconKeys.push_back(cells[i].iconKey);
+            g.minRow = std::min(g.minRow, i / BOX_COLS);
+            g.minCol = std::min(g.minCol, i % BOX_COLS);
+        }
+        clearSelection();
+        if (g.slots.empty())
+        {
+            setStatus("Nothing to pick up in that selection", col::DIM);
+            return;
+        }
+        // Single Pokemon in the selection: behave exactly like a normal pick-up.
+        if (g.slots.size() == 1)
+        {
+            held     = SlotRef{g.pane, g.box, g.slots[0]};
+            heldIcon = g.iconKeys[0];
             invalidate();
-            setStatus("Moved (not saved yet)", col::GOOD);
+            setStatus("Holding - A to place, X to send, B to put back", col::MODE_HOLD);
+            return;
+        }
+        const size_t n = g.slots.size();
+        group          = std::move(g);
+        invalidate();
+        setStatus("Holding " + std::to_string(n) +
+                      " - cursor is the group's top-left. A place, X send, B put back",
+            col::MODE_GROUP);
+    }
+
+    void App::placeGroup()
+    {
+        const int cur = cursor[paneIdx()];
+        const int cr = cur / BOX_COLS, cc = cur % BOX_COLS;
+        std::vector<SlotRef> from, to;
+        bool same = true;
+        for (int s : group->slots)
+        {
+            const int r = s / BOX_COLS - group->minRow + cr;
+            const int c = s % BOX_COLS - group->minCol + cc;
+            if (r >= BOX_ROWS || c >= BOX_COLS)
+            {
+                setStatus("The group doesn't fit here - move the cursor up or left", col::WARN);
+                return;
+            }
+            from.push_back(SlotRef{group->pane, group->box, s});
+            to.push_back(SlotRef{pane, boxIdx[paneIdx()], r * BOX_COLS + c});
+            same = same && from.back() == to.back();
+        }
+        if (same)
+        {
+            group.reset(); // put back exactly where it was: nothing changes
+            invalidate();
+            setStatus("Put back", col::DIM);
+            return;
+        }
+        std::string why;
+        if (storage->moveGroup(from, to, why))
+        {
+            setStatus("Moved " + std::to_string(from.size()) + " (not saved yet)", col::GOOD);
+            group.reset();
+            invalidate();
         }
         else
         {
             setStatus(why, col::WARN);
+        }
+    }
+
+    void App::sendToOtherSide()
+    {
+        std::vector<SlotRef> from;
+        if (group)
+        {
+            for (int s : group->slots) from.push_back(SlotRef{group->pane, group->box, s});
+        }
+        else if (held)
+        {
+            from.push_back(*held);
+        }
+        else if (selectionHere())
+        {
+            for (int i = 0; i < BOX_SLOTS; i++)
+            {
+                if (sel->marked[i] && !storage->box(sel->pane, sel->box).slots[i].empty())
+                {
+                    from.push_back(SlotRef{sel->pane, sel->box, i});
+                }
+            }
+        }
+        else if (!storage->at(cursorRef()).empty())
+        {
+            from.push_back(cursorRef());
+        }
+        if (from.empty())
+        {
+            setStatus("Nothing to send", col::DIM);
+            return;
+        }
+
+        const Pane src  = from[0].pane;
+        const Pane dest = src == Pane::Save ? Pane::Bank : Pane::Save;
+        if (!storage->hasPane(dest))
+        {
+            setStatus("Bank only - no game save loaded to send to", col::WARN);
+            return;
+        }
+        const int destIdx = dest == Pane::Save ? 0 : 1;
+        auto targets      = storage->findEmpty(dest, (int)from.size(), boxIdx[destIdx]);
+        if (targets.size() < from.size())
+        {
+            setStatus(std::string("Not enough room in the ") + paneName(dest) + " (needs " +
+                          std::to_string(from.size()) + " free slots)",
+                col::WARN);
+            return;
+        }
+        std::string why;
+        if (storage->moveGroup(from, targets, why))
+        {
+            setStatus("Sent " + std::to_string(from.size()) + " to the " + paneName(dest) +
+                          ", from box " + std::to_string(targets[0].box + 1) +
+                          " (not saved yet)",
+                col::GOOD);
+            held.reset();
+            group.reset();
+            clearSelection();
+            invalidate();
+        }
+        else
+        {
+            setStatus(why, col::WARN);
+        }
+    }
+
+    void App::cancel()
+    {
+        if (group || held)
+        {
+            group.reset();
+            held.reset();
+            invalidate();
+            setStatus("Put back", col::DIM);
+        }
+        else if (sel)
+        {
+            clearSelection();
+            setStatus("Selection cleared", col::DIM);
         }
     }
 
@@ -364,6 +731,7 @@ namespace db
         const int n = storage->boxCount(pane);
         if (n <= 0) return;
         boxIdx[paneIdx()] = (boxIdx[paneIdx()] + delta + n) % n;
+        clearSelection(); // a selection belongs to one box; a carried group comes along
         invalidate();
     }
 
@@ -375,52 +743,53 @@ namespace db
             return;
         }
         pane = pane == Pane::Save ? Pane::Bank : Pane::Save;
+        clearSelection();
         invalidate();
     }
 
-    void App::inputConfirmExit(u32 down)
+    void App::setSelectionRect(int a, int b)
     {
-        if (down & KEY_A)
+        Selection s;
+        s.pane = pane;
+        s.box  = boxIdx[paneIdx()];
+        const int r0 = std::min(a / BOX_COLS, b / BOX_COLS), r1 = std::max(a / BOX_COLS, b / BOX_COLS);
+        const int c0 = std::min(a % BOX_COLS, b % BOX_COLS), c1 = std::max(a % BOX_COLS, b % BOX_COLS);
+        for (int r = r0; r <= r1; r++)
         {
-            std::string err;
-            if (saveAll(err))
+            for (int c = c0; c <= c1; c++)
             {
-                quit = true;
-            }
-            else
-            {
-                state = State::BoxView;
-                showMessage("Save failed: " + err +
-                                "\nNothing was lost: your moves are still here and the backups "
-                                "are in sdmc:/3ds/DB/backups/",
-                    true);
+                s.marked[r * BOX_COLS + c] = true;
             }
         }
-        else if (down & KEY_X)
-        {
-            quit = true; // nothing written
-        }
-        else if (down & KEY_B)
-        {
-            state = State::BoxView;
-        }
+        sel = s;
     }
 
-    void App::inputMessage(u32 down)
+    void App::clearSelection()
     {
-        if (down & (KEY_A | KEY_B))
-        {
-            state = messageReturn;
-        }
+        sel.reset();
+        ySelecting = false;
     }
 
     // =====================================================================================
-    // Render
+    // Render helpers
     // =====================================================================================
 
     SlotRef App::cursorRef() const
     {
         return SlotRef{pane, boxIdx[paneIdx()], cursor[paneIdx()]};
+    }
+
+    bool App::selectionHere() const
+    {
+        return sel && sel->pane == pane && sel->box == boxIdx[paneIdx()];
+    }
+
+    u32 App::modeColor() const
+    {
+        if (group) return col::MODE_GROUP;
+        if (held) return col::MODE_HOLD;
+        if (ySelecting || selectionHere()) return col::MODE_SELECT;
+        return col::MODE_POINT;
     }
 
     void App::invalidate()
@@ -456,21 +825,54 @@ namespace db
         }
         if (changed)
         {
-            // Keep only the icons of the visible box (+ the summary's) in memory.
+            // Keep only what's on screen in memory: this box, the summary, and anything
+            // being carried in from another box.
             std::unordered_set<int> keep;
-            for (const CellInfo& c : cells)
-            {
-                keep.insert(c.iconKey);
-            }
+            for (const CellInfo& c : cells) keep.insert(c.iconKey);
             keep.insert(summary.iconKey);
+            if (held) keep.insert(heldIcon);
+            if (group) keep.insert(group->iconKeys.begin(), group->iconKeys.end());
             icons.retainOnly(keep);
         }
     }
 
+    float App::drawButton(float x, float y, const char* name)
+    {
+        // Face buttons are circles in the classic four colors; everything else is a pill.
+        const char n = name[0];
+        if (name[1] == '\0' && (n == 'A' || n == 'B' || n == 'X' || n == 'Y'))
+        {
+            const u32 c = n == 'A' ? rgba(0xE0, 0x5A, 0x5A)
+                        : n == 'B' ? rgba(0xD9, 0xA9, 0x3A)
+                        : n == 'X' ? rgba(0x4F, 0x8F, 0xD9)
+                                   : rgba(0x4F, 0xB3, 0x6B);
+            gfx.circle(x + 8, y + 8, 8, c);
+            gfx.text(x + 8, y + 1.5f, 0.42f, col::TEXT, name, Align::Center);
+            return 16;
+        }
+        const float w = 8 + 6.5f * std::strlen(name);
+        gfx.roundRect(x, y, w, 16, 8, rgba(0x5A, 0x60, 0x78));
+        gfx.text(x + w / 2, y + 2, 0.36f, col::TEXT, name, Align::Center, w - 4);
+        return w;
+    }
+
+    // =====================================================================================
+    // Render
+    // =====================================================================================
+
     void App::render()
     {
-        if (state == State::BoxView || state == State::ConfirmExit ||
-            (state == State::Message && messageReturn != State::GameSelect))
+        frame++;
+        const bool listScreens =
+            state == State::GameSelect || state == State::Credits ||
+            (state == State::Message &&
+                (messageReturn == State::GameSelect || messageReturn == State::Credits));
+
+        if (listScreens)
+        {
+            snow.update();
+        }
+        else
         {
             refreshCaches();
         }
@@ -478,75 +880,150 @@ namespace db
         gfx.beginFrame();
 
         gfx.drawTop();
-        if (state == State::Credits)
+        if (listScreens)
         {
-            renderCredits();
-        }
-        else if (state == State::GameSelect ||
-                 (state == State::Message && messageReturn == State::GameSelect))
-        {
-            renderGameList();
+            snow.drawTop(gfx);
+            if (state == State::Credits) renderCredits();
+            else renderGameListTop();
         }
         else
         {
             renderSummary();
+            renderStatusBar();
         }
-        renderStatusBar();
-        if (state == State::ConfirmExit) renderConfirmExit();
+        if (state == State::Menu) renderMenu();
+        if (state == State::Help) renderHelp();
         if (state == State::Message) renderMessage();
 
         gfx.drawBottom();
-        if (state == State::Credits)
+        if (listScreens)
         {
-            gfx.text(BOTTOM_W / 2, 110, 0.5f, col::DIM, "B: back", Align::Center);
-        }
-        else if (state == State::GameSelect ||
-                 (state == State::Message && messageReturn == State::GameSelect))
-        {
-            gfx.text(BOTTOM_W / 2, 70, 0.55f, col::TEXT, "Choose a save", Align::Center);
-            gfx.text(BOTTOM_W / 2, 100, 0.42f, col::DIM,
-                "A: open   Y: rescan   X: credits   START: exit", Align::Center);
-            gfx.text(BOTTOM_W / 2, 132, 0.4f, col::DIM,
-                "Gen 4/5 DS carts: insert, then press Y", Align::Center);
-            gfx.text(BOTTOM_W / 2, 152, 0.4f, col::DIM, "GBA / emulator saves: put .sav files in",
-                Align::Center);
-            gfx.text(BOTTOM_W / 2, 168, 0.4f, col::DIM, "sdmc:/3ds/DB/saves/", Align::Center);
+            snow.drawBottom(gfx);
+            renderGameListBottom();
         }
         else
         {
             renderGrid();
+            if (state == State::Help) renderHelpLegend();
         }
 
         gfx.endFrame();
     }
 
-    void App::renderGameList()
-    {
-        gfx.rect(0, 0, TOP_W, TOP_HEADER_H, col::PANEL);
-        gfx.text(8, 2, 0.5f, col::TEXT, "Devious Bank");
-        gfx.text(TOP_W - 8, 3, 0.42f, col::DIM,
-            std::to_string(saves.size()) + " save(s) found", Align::Right);
+    // ---- Game select -------------------------------------------------------------------
 
-        const int entries = (int)saves.size() + 1;
-        const int first   = std::clamp(listCursor - LIST_ROWS / 2, 0,
-                std::max(0, entries - LIST_ROWS));
-        for (int i = 0; i < LIST_ROWS && first + i < entries; i++)
+    void App::renderGameListTop()
+    {
+        gfx.text(14, 8, 0.7f, rgba(0, 0, 0, 0x80), "Devious Bank"); // drop shadow
+        gfx.text(12, 6, 0.7f, col::TEXT, "Devious Bank");
+        gfx.text(TOP_W - 12, 12, 0.42f, col::DIM,
+            std::to_string(saves.size()) + (saves.size() == 1 ? " save found" : " saves found"),
+            Align::Right);
+
+        const int entries  = (int)saves.size() + 1;
+        const int rows     = (entries + CARD_COLS - 1) / CARD_COLS;
+        const int curRow   = listCursor / CARD_COLS;
+        const int firstRow = std::clamp(curRow - 1, 0, std::max(0, rows - CARD_ROWS));
+
+        for (int r = 0; r < CARD_ROWS; r++)
         {
-            const int idx = first + i;
-            const int y   = TOP_HEADER_H + 4 + i * 18;
-            if (idx == listCursor)
+            for (int c = 0; c < CARD_COLS; c++)
             {
-                gfx.rect(4, y, TOP_W - 8, 18, col::CELL_FULL);
+                const int idx = (firstRow + r) * CARD_COLS + c;
+                if (idx >= entries) break;
+
+                const bool isSel = idx == listCursor;
+                float x = CARD_X0 + c * (CARD_W + CARD_GX);
+                float y = CARD_Y0 + r * (CARD_H + CARD_GY);
+
+                std::string title, tag, badge;
+                u32 accent;
+                if (idx == 0)
+                {
+                    title  = "Bank only";
+                    tag    = "Just your bank, no game save";
+                    badge  = "Bank";
+                    accent = col::GEN[0];
+                }
+                else
+                {
+                    const SaveLocation& s = saves[idx - 1];
+                    const int g           = std::clamp((int)s.format, 1, 7);
+                    title                 = s.game;
+                    tag                   = s.tag;
+                    badge                 = "Gen " + std::to_string(g);
+                    accent                = col::GEN[g];
+                }
+
+                if (isSel)
+                {
+                    // Raised card: lift it, drop a shadow, outline it.
+                    gfx.roundRect(x + 3, y + 4, CARD_W, CARD_H, 8, rgba(0x08, 0x0C, 0x18));
+                    y -= 3;
+                    gfx.roundRect(x - 2, y - 2, CARD_W + 4, CARD_H + 4, 9, col::CURSOR);
+                }
+                gfx.roundRect(x, y, CARD_W, CARD_H, 7, isSel ? col::CARD_SEL : col::CARD);
+                gfx.roundRect(x + 8, y + 9, 5, CARD_H - 18, 2.5f, accent);
+                gfx.text(x + 22, y + 8, 0.55f, col::TEXT, title, Align::Left, CARD_W - 84);
+                gfx.text(x + 22, y + 31, 0.4f, col::DIM, tag, Align::Left, CARD_W - 30);
+                gfx.roundRect(x + CARD_W - 52, y + 9, 44, 16, 8, accent);
+                gfx.text(x + CARD_W - 30, y + 11, 0.38f, col::TEXT, badge, Align::Center, 40);
             }
-            const std::string label = idx == 0 ? "Bank only (no game save)" : saves[idx - 1].label;
-            gfx.text(12, y + 2, 0.48f, idx == 0 ? col::DIM : col::TEXT, label, Align::Left,
-                TOP_W - 24);
+        }
+
+        // Scroll hints
+        if (firstRow > 0)
+        {
+            gfx.text(TOP_W / 2, CARD_Y0 - 14, 0.4f, col::DIM, "more above", Align::Center);
+        }
+        if (firstRow + CARD_ROWS < rows)
+        {
+            gfx.text(TOP_W / 2, SCREEN_H - 16, 0.4f, col::DIM, "more below", Align::Center);
         }
     }
 
+    void App::renderGameListBottom()
+    {
+        const float px = 20, py = 20, pw = BOTTOM_W - 40;
+        if (state == State::Credits ||
+            (state == State::Message && messageReturn == State::Credits))
+        {
+            gfx.roundRect(px, 90, pw, 50, 10, col::CARD);
+            const float w = drawButton(BOTTOM_W / 2 - 40, 107, "B");
+            gfx.text(BOTTOM_W / 2 - 40 + w + 8, 107, 0.48f, col::TEXT, "Back");
+            return;
+        }
+
+        gfx.roundRect(px, py, pw, 118, 10, col::CARD);
+        gfx.text(BOTTOM_W / 2, py + 8, 0.5f, col::TEXT, "Choose a save", Align::Center);
+
+        // 2x2 button guide
+        struct Row
+        {
+            const char* btn;
+            const char* what;
+        };
+        const Row rows[] = {{"A", "Open"}, {"Y", "Rescan"}, {"X", "Credits"}, {"START", "Exit"}};
+        for (int i = 0; i < 4; i++)
+        {
+            const float x = px + 22 + (i % 2) * 136;
+            const float y = py + 38 + (i / 2) * 28;
+            const float w = drawButton(x, y, rows[i].btn);
+            gfx.text(x + w + 8, y, 0.46f, col::TEXT, rows[i].what);
+        }
+        gfx.text(BOTTOM_W / 2, py + 98, 0.36f, col::DIM, "+Pad: choose a tile", Align::Center);
+
+        gfx.roundRect(px, 150, pw, 62, 10, col::CARD);
+        gfx.text(px + 14, 158, 0.4f, col::TEXT, "Gen 4/5 DS cart: insert it, then press Y");
+        gfx.text(px + 14, 176, 0.4f, col::TEXT, "GBA / emulator saves: copy .sav files to");
+        gfx.text(px + 14, 192, 0.4f, col::DIM, "sdmc:/3ds/DB/saves/");
+    }
+
+    // ---- Box view: top screen ------------------------------------------------------------
+
     void App::renderSummary()
     {
-        // Header: which game + unsaved marker
+        gfx.gradient(0, 0, TOP_W, SCREEN_H, col::BG, rgba(0x18, 0x19, 0x22));
         gfx.rect(0, 0, TOP_W, TOP_HEADER_H, col::PANEL);
         gfx.text(8, 2, 0.5f, col::TEXT, save ? save->gameName() : "Bank only", Align::Left, 260);
         if (storage && storage->dirty())
@@ -562,9 +1039,10 @@ namespace db
 
         gfx.text(8, 24, 0.6f, col::TEXT, summary.title, Align::Left, 290);
 
-        // Sprite: 64x56 icon at 1.25x (80x70) in the top-right corner.
+        // Sprite: 64x56 icon at 1.25x (80x70) on a soft shadow in the top-right corner.
         if (const C2D_Image* img = icons.get(summary.iconKey))
         {
+            gfx.ellipse(TOP_W - 78, TOP_HEADER_H + 60, 60, 12, col::SHADOW);
             gfx.image(*img, TOP_W - 88, TOP_HEADER_H + 2, 1.25f);
         }
 
@@ -613,94 +1091,286 @@ namespace db
     void App::renderStatusBar()
     {
         gfx.rect(0, STATUS_Y, TOP_W, SCREEN_H - STATUS_Y, col::PANEL);
-        if (!status.empty())
+        gfx.rect(0, STATUS_Y, 4, SCREEN_H - STATUS_Y, modeColor()); // mode color stripe
+
+        if (!status.empty() && frame - statusFrame < STATUS_FRAMES)
         {
-            gfx.text(6, STATUS_Y + 3, 0.42f, statusColor, status, Align::Left, TOP_W - 12);
+            gfx.text(10, STATUS_Y + 3, 0.42f, statusColor, status, Align::Left, TOP_W - 16);
+            return;
         }
-        else if (state == State::BoxView)
-        {
-            gfx.text(6, STATUS_Y + 3, 0.4f, col::DIM,
-                "A pick/place  B cancel  L/R box  SELECT save/bank  START exit", Align::Left,
-                TOP_W - 12);
-        }
+
+        // Context hint for the current mode.
+        std::string hint;
+        if (group)
+            hint = "Holding " + std::to_string(group->slots.size()) +
+                   ": A place (cursor = top-left)  X send  B put back";
+        else if (held)
+            hint = "Holding: A place/swap  X send  B put back";
+        else if (ySelecting)
+            hint = "Keep holding Y and move to grow the selection";
+        else if (selectionHere())
+            hint = "Selected " + std::to_string(sel->count()) +
+                   ": A pick up  X send all  B clear";
+        else
+            hint = "A pick up  Y+move select  X send  START menu & button guide";
+        gfx.text(10, STATUS_Y + 3, 0.4f, col::DIM, hint, Align::Left, TOP_W - 16);
     }
+
+    // ---- Box view: bottom screen ---------------------------------------------------------
 
     void App::renderGrid()
     {
+        gfx.gradient(0, 0, BOTTOM_W, SCREEN_H, col::BG, rgba(0x18, 0x19, 0x22));
         if (!storage || storage->boxCount(pane) == 0)
         {
             return;
         }
         const int bi   = boxIdx[paneIdx()];
         const Box& box = storage->box(pane, bi);
+        const int cur  = cursor[paneIdx()];
 
-        // Header: < [SAVE|BANK] box name (n/N) >
-        gfx.rect(0, 0, BOTTOM_W, HEADER_H, pane == Pane::Save ? col::SAVE_HDR : col::BANK_HDR);
-        gfx.text(10, 4, 0.55f, col::TEXT, "<");
-        gfx.text(BOTTOM_W - 10, 4, 0.55f, col::TEXT, ">", Align::Right);
-        const std::string title = std::string(pane == Pane::Save ? "SAVE  " : "BANK  ") + box.name +
-                                  "  (" + std::to_string(bi + 1) + "/" +
-                                  std::to_string(storage->boxCount(pane)) + ")";
-        gfx.text(BOTTOM_W / 2, 5, 0.48f, col::TEXT, title, Align::Center, BOTTOM_W - 60);
+        // ---- Header: [L] SAVE · box name  n/N [R]
+        const u32 hdr = pane == Pane::Save ? col::SAVE_HDR : col::BANK_HDR;
+        gfx.rect(0, 0, BOTTOM_W, HEADER_H, hdr);
+        drawButton(6, 6, "L");
+        drawButton(BOTTOM_W - 6 - 14.5f, 6, "R");
+        gfx.roundRect(30, 5, 44, 18, 9, rgba(0x00, 0x00, 0x00));
+        gfx.text(52, 7, 0.42f, col::TEXT, pane == Pane::Save ? "SAVE" : "BANK", Align::Center);
+        gfx.text(82, 6, 0.48f, col::TEXT, box.name, Align::Left, 160);
+        gfx.text(BOTTOM_W - 28, 7, 0.42f, col::TEXT,
+            std::to_string(bi + 1) + "/" + std::to_string(storage->boxCount(pane)), Align::Right);
 
-        for (int i = 0; i < BOX_SLOTS; i++)
+        // ---- Where a carried group would land (pink if it fits, red if it doesn't)
+        std::array<bool, BOX_SLOTS> preview{};
+        bool previewFits = true;
+        if (group)
         {
-            const int x       = GRID_X + (i % BOX_COLS) * CELL_W;
-            const int y       = GRID_Y + (i / BOX_COLS) * CELL_H;
-            const CellInfo& c = cells[i];
-            const bool isHeldOrigin =
-                held && held->pane == pane && held->box == bi && held->slot == i;
-
-            u32 bg = col::CELL;
-            if (c.bad) bg = col::CELL_BAD;
-            else if (isHeldOrigin) bg = col::CELL_HELD;
-            else if (c.present) bg = col::CELL_FULL;
-            gfx.rect(x + 1, y + 1, CELL_W - 2, CELL_H - 2, bg);
-
-            if (c.present)
+            const int cr = cur / BOX_COLS, cc = cur % BOX_COLS;
+            for (int s : group->slots)
             {
-                if (const C2D_Image* img = icons.get(c.iconKey))
+                const int r = s / BOX_COLS - group->minRow + cr;
+                const int c = s % BOX_COLS - group->minCol + cc;
+                if (r >= BOX_ROWS || c >= BOX_COLS)
                 {
-                    // 64x56 icon at 0.66 = 42x37, centered in the 48x40 cell.
-                    gfx.image(*img, x + 3, y + 1, ICON_SCALE, isHeldOrigin ? 0.35f : 1.0f);
+                    previewFits = false;
+                    continue;
                 }
-                else
+                const int t = r * BOX_COLS + c;
+                preview[t]  = true;
+                const bool ownSpot = group->pane == pane && group->box == bi &&
+                                     std::find(group->slots.begin(), group->slots.end(), t) !=
+                                         group->slots.end();
+                if (cells[t].present && !ownSpot)
                 {
-                    // No icon file: fall back to the species name.
-                    gfx.text(x + CELL_W / 2, y + 8, 0.38f, isHeldOrigin ? col::DIM : col::TEXT,
-                        c.name, Align::Center, CELL_W - 4);
-                }
-                if (!c.egg)
-                {
-                    gfx.text(x + CELL_W - 3, y + CELL_H - 12, 0.3f, col::TEXT,
-                        std::to_string(c.level), Align::Right);
-                }
-                if (pane == Pane::Bank)
-                {
-                    gfx.text(x + 3, y + CELL_H - 12, 0.3f, col::DIM,
-                        "G" + std::to_string((int)c.format));
-                }
-                if (c.shiny)
-                {
-                    gfx.text(x + 3, y + 1, 0.34f, col::SHINY, "★");
+                    previewFits = false;
                 }
             }
         }
 
-        // Cursor: yellow normally, green while holding a Pokemon.
-        const int cur = cursor[paneIdx()];
-        gfx.frame(GRID_X + (cur % BOX_COLS) * CELL_W, GRID_Y + (cur / BOX_COLS) * CELL_H, CELL_W,
-            CELL_H, 2, held ? col::GOOD : col::CURSOR);
+        auto isOrigin = [&](int i)
+        {
+            if (held && held->pane == pane && held->box == bi && held->slot == i) return true;
+            return group && group->pane == pane && group->box == bi &&
+                   std::find(group->slots.begin(), group->slots.end(), i) != group->slots.end();
+        };
+
+        // ---- Tray and tiles
+        gfx.roundRect(GRID_X - 7, GRID_Y - 6, GRID_W + 14, GRID_H + 12, 10, col::TRAY);
+        const float bob = std::sin(frame * 0.08f) * 1.2f;
+
+        for (int i = 0; i < BOX_SLOTS; i++)
+        {
+            const float x     = tileX(i);
+            const float y     = tileY(i);
+            const CellInfo& c = cells[i];
+            const bool origin = isOrigin(i);
+            const bool marked = selectionHere() && sel->marked[i];
+            const bool hover  = i == cur;
+
+            // Outline drawn behind the tile so it reads as a rounded border.
+            if (hover)
+                gfx.roundRect(x - 2, y - 2, TILE_W + 4, TILE_H + 4, 7, modeColor());
+            else if (preview[i])
+                gfx.roundRect(x - 2, y - 2, TILE_W + 4, TILE_H + 4, 7,
+                    previewFits ? col::MODE_GROUP : col::WARN);
+            else if (marked)
+                gfx.roundRect(x - 2, y - 2, TILE_W + 4, TILE_H + 4, 7, col::MODE_SELECT);
+
+            u32 bg = col::CELL;
+            if (c.bad) bg = col::CELL_BAD;
+            else if (hover) bg = col::CELL_HOVER;
+            else if (c.present && !origin) bg = col::CELL_FULL;
+            gfx.roundRect(x, y, TILE_W, TILE_H, 5, bg);
+            if (marked)
+            {
+                gfx.rect(x + 2, y + 2, TILE_W - 4, TILE_H - 4, col::SELECT_TINT);
+            }
+
+            if (!c.present)
+            {
+                continue;
+            }
+
+            const C2D_Image* img = icons.get(c.iconKey);
+            // The hovered Pokemon lifts off its tile with a shadow, unless something is being
+            // carried (then the carried sprite floats there instead).
+            const bool lift = hover && !origin && !carrying();
+            if (img && lift)
+            {
+                gfx.ellipse(x + 8, y + TILE_H - 8, TILE_W - 16, 7, col::SHADOW);
+                gfx.image(*img, x + (TILE_W - 64 * RAISE_SCALE) / 2,
+                    y - 6 + bob, RAISE_SCALE);
+            }
+            else if (img)
+            {
+                gfx.image(*img, x + (TILE_W - 64 * ICON_SCALE) / 2, y, ICON_SCALE,
+                    origin ? 0.3f : 1.0f);
+            }
+            else
+            {
+                gfx.text(x + TILE_W / 2, y + 10, 0.34f, origin ? col::DIM : col::TEXT, c.name,
+                    Align::Center, TILE_W - 4);
+            }
+
+            if (!origin)
+            {
+                if (!c.egg)
+                {
+                    gfx.text(x + TILE_W - 2, y + TILE_H - 10, 0.28f, col::TEXT,
+                        std::to_string(c.level), Align::Right);
+                }
+                if (pane == Pane::Bank)
+                {
+                    gfx.text(x + 2, y + TILE_H - 10, 0.28f, col::DIM,
+                        "G" + std::to_string((int)c.format));
+                }
+                if (c.shiny)
+                {
+                    gfx.text(x + 2, y, 0.32f, col::SHINY, "★");
+                }
+            }
+        }
+
+        // ---- Carried Pokemon float above the grid, following the cursor.
+        auto floatIcon = [&](int iconKey, int slot)
+        {
+            const float x = tileX(slot), y = tileY(slot);
+            gfx.ellipse(x + 6, y + TILE_H - 7, TILE_W - 12, 7, col::SHADOW);
+            if (const C2D_Image* img = icons.get(iconKey))
+            {
+                gfx.image(*img, x + (TILE_W - 64 * RAISE_SCALE) / 2, y - 12 + bob, RAISE_SCALE,
+                    0.95f);
+            }
+        };
+        if (held)
+        {
+            floatIcon(heldIcon, cur);
+        }
+        else if (group)
+        {
+            const int cr = cur / BOX_COLS, cc = cur % BOX_COLS;
+            for (size_t k = 0; k < group->slots.size(); k++)
+            {
+                const int s = group->slots[k];
+                const int r = s / BOX_COLS - group->minRow + cr;
+                const int c = s % BOX_COLS - group->minCol + cc;
+                if (r < BOX_ROWS && c < BOX_COLS)
+                {
+                    floatIcon(group->iconKeys[k], r * BOX_COLS + c);
+                }
+            }
+        }
     }
 
-    void App::renderConfirmExit()
+    // ---- Overlays ------------------------------------------------------------------------
+
+    void App::renderMenu()
     {
         gfx.rect(0, 0, TOP_W, SCREEN_H, col::OVERLAY);
-        gfx.rect(40, 60, TOP_W - 80, 120, col::PANEL);
-        gfx.text(TOP_W / 2, 72, 0.55f, col::TEXT, "You have unsaved changes", Align::Center);
-        gfx.text(TOP_W / 2, 104, 0.48f, col::GOOD, "A: Save everything and exit", Align::Center);
-        gfx.text(TOP_W / 2, 124, 0.48f, col::WARN, "X: Exit WITHOUT saving", Align::Center);
-        gfx.text(TOP_W / 2, 144, 0.48f, col::DIM, "B: Back", Align::Center);
+        const float w = 240, h = 40 + menu.size() * 26.0f;
+        const float x = (TOP_W - w) / 2, y = (SCREEN_H - h) / 2;
+        gfx.roundRect(x, y, w, h, 10, col::CARD);
+        gfx.text(TOP_W / 2, y + 8, 0.5f, col::TEXT, "Menu", Align::Center);
+        for (size_t i = 0; i < menu.size(); i++)
+        {
+            const float iy = y + 32 + i * 26.0f;
+            if ((int)i == menuCursor)
+            {
+                gfx.roundRect(x + 10, iy - 2, w - 20, 22, 6, col::CARD_SEL);
+                gfx.roundRect(x + 10, iy - 2, 4, 22, 2, col::CURSOR);
+            }
+            gfx.text(x + 24, iy + 1, 0.46f, menu[i].color, menu[i].label);
+        }
+    }
+
+    void App::renderHelp()
+    {
+        struct Row
+        {
+            const char* btn;
+            const char* btn2; // optional second badge
+            const char* what;
+        };
+        static const Row ROWS[] = {
+            {"+Pad", nullptr, "Move the cursor (Circle Pad works too)"},
+            {"A", nullptr, "Pick up / place - swaps if the spot is taken"},
+            {"Y", nullptr, "Hold + move: select an area (or drag the stylus)"},
+            {"A", nullptr, "On a selection: pick up the whole group"},
+            {"X", nullptr, "Send to the Bank (from the Bank: to the save)"},
+            {"B", nullptr, "Put back / clear the selection"},
+            {"L", "R", "Previous / next box"},
+            {"SELECT", nullptr, "Switch between Save and Bank"},
+            {"START", nullptr, "Menu: save, exit, this guide"},
+        };
+
+        gfx.rect(0, 0, TOP_W, SCREEN_H, col::OVERLAY);
+        gfx.roundRect(10, 6, TOP_W - 20, SCREEN_H - 12, 10, col::CARD);
+        gfx.text(TOP_W / 2, 12, 0.55f, col::TEXT, "Button guide", Align::Center);
+
+        float y = 38;
+        for (const Row& r : ROWS)
+        {
+            float x = 24;
+            x += drawButton(x, y, r.btn) + 4;
+            if (r.btn2)
+            {
+                x += drawButton(x, y, r.btn2) + 4;
+            }
+            gfx.text(92, y + 1, 0.42f, col::TEXT, r.what, Align::Left, TOP_W - 120);
+            y += 19;
+        }
+        gfx.text(TOP_W / 2, SCREEN_H - 26, 0.42f, col::CURSOR, "Press A to start",
+            Align::Center);
+    }
+
+    void App::renderHelpLegend()
+    {
+        // Cursor colors, drawn as sample tiles on the bottom screen.
+        gfx.rect(0, 0, BOTTOM_W, SCREEN_H, col::OVERLAY);
+        gfx.roundRect(14, 14, BOTTOM_W - 28, SCREEN_H - 28, 10, col::CARD);
+        gfx.text(BOTTOM_W / 2, 22, 0.5f, col::TEXT, "Cursor colors", Align::Center);
+
+        struct Sample
+        {
+            u32 color;
+            const char* what;
+        };
+        const Sample samples[] = {
+            {col::MODE_POINT, "Pointing"},
+            {col::MODE_SELECT, "Selecting an area"},
+            {col::MODE_HOLD, "Holding one Pokemon"},
+            {col::MODE_GROUP, "Holding a group"},
+        };
+        float y = 50;
+        for (const Sample& s : samples)
+        {
+            gfx.roundRect(36, y - 2, 30, 26, 6, s.color);
+            gfx.roundRect(38, y, 26, 22, 5, col::CELL_HOVER);
+            gfx.text(80, y + 3, 0.45f, col::TEXT, s.what);
+            y += 34;
+        }
+        gfx.text(BOTTOM_W / 2, y + 2, 0.38f, col::DIM, "Stylus: tap = A, drag = select or carry",
+            Align::Center, BOTTOM_W - 40);
     }
 
     void App::renderCredits()
@@ -723,14 +1393,14 @@ namespace db
             "Pokemon and all related names are trademarks of",
             "Nintendo, Game Freak and Creatures Inc.",
         };
-        gfx.rect(0, 0, TOP_W, TOP_HEADER_H, col::PANEL);
-        gfx.text(8, 2, 0.5f, col::TEXT, "Credits");
-        int y = TOP_HEADER_H + 6;
+        gfx.roundRect(8, 6, TOP_W - 16, SCREEN_H - 12, 10, col::CARD);
+        gfx.text(TOP_W / 2, 10, 0.5f, col::TEXT, "Credits", Align::Center);
+        int y = 32;
         for (const char* line : LINES)
         {
-            gfx.text(10, y, 0.42f, line[0] == ' ' ? col::DIM : col::TEXT, line, Align::Left,
-                TOP_W - 20);
-            y += 14; // 14 lines * 14px ends right at the status bar
+            gfx.text(18, y, 0.4f, line[0] == ' ' ? col::DIM : col::TEXT, line, Align::Left,
+                TOP_W - 36);
+            y += 13; // 14 lines * 13px ends inside the card
         }
     }
 
@@ -740,8 +1410,8 @@ namespace db
         const int h      = 40 + (int)lines.size() * 16;
         const int y0     = std::max(10, (SCREEN_H - h) / 2);
         gfx.rect(0, 0, TOP_W, SCREEN_H, col::OVERLAY);
-        gfx.rect(20, y0, TOP_W - 40, h, col::PANEL);
-        gfx.frame(20, y0, TOP_W - 40, h, 2, messageError ? col::WARN : col::GOOD);
+        gfx.roundRect(18, y0 - 2, TOP_W - 36, h + 4, 10, messageError ? col::WARN : col::GOOD);
+        gfx.roundRect(20, y0, TOP_W - 40, h, 9, col::CARD);
         int y = y0 + 10;
         for (const auto& line : lines)
         {

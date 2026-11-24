@@ -142,6 +142,15 @@ namespace db
             return i18n::game(pksm::Language::ENG, sav.version());
         }
 
+        // Fills the display fields of a location found by a scan.
+        void describe(SaveLocation& loc, const pksm::Sav& sav, const std::string& tag)
+        {
+            loc.game  = gameLabel(sav);
+            loc.tag   = tag;
+            loc.label = loc.game + " [" + tag + "]";
+            (void)formatFromGeneration(sav.generation(), loc.format);
+        }
+
         void scanTitles(FS_MediaType media, std::vector<SaveLocation>& out)
         {
             u32 count = 0;
@@ -211,8 +220,12 @@ namespace db
                     loc.media   = media;
                     loc.titleId = tid;
                     loc.path    = file;
-                    loc.label   = gameLabel(*sav) +
-                                (media == MEDIATYPE_GAME_CARD ? " [Cart]" : " [Digital]");
+                    PkxFormat f = PkxFormat::Empty;
+                    (void)formatFromGeneration(sav->generation(), f);
+                    const bool vc = f <= PkxFormat::PK2;
+                    describe(loc, *sav,
+                        media == MEDIATYPE_GAME_CARD ? "3DS Cart"
+                                                     : (vc ? "Virtual Console" : "Digital"));
                     out.push_back(loc);
                     break; // one save per title
                 }
@@ -261,7 +274,7 @@ namespace db
                 SaveLocation loc;
                 loc.medium = SaveMedium::SdFile;
                 loc.path   = p;
-                loc.label  = gameLabel(*sav) + " [SD: " + p.substr(p.find_last_of('/') + 1) + "]";
+                describe(loc, *sav, "SD: " + p.substr(p.find_last_of('/') + 1));
                 out.push_back(loc);
             }
         }
@@ -289,7 +302,7 @@ namespace db
             loc.medium = SaveMedium::DsCart;
             loc.cart   = cart;
             loc.path   = cart.gameCode; // also names the backup file
-            loc.label  = gameLabel(*sav) + " [DS Cart]";
+            describe(loc, *sav, "DS Cart");
             out.push_back(loc);
         }
 

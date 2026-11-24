@@ -36,7 +36,10 @@ namespace db
         uint64_t titleId      = 0;            // TitleArchive only
         dscart::CartInfo cart;                // DsCart only
         std::string path;                     // file inside the archive, SD path, or game code
-        std::string label;                    // shown in the game list
+        std::string label;                    // full "<game> [<tag>]" text for messages
+        std::string game;                     // game name, e.g. "HeartGold"
+        std::string tag;                      // where it lives, e.g. "DS Cart", "Digital"
+        PkxFormat format = PkxFormat::Empty;  // generation, for the tile color
     };
 
     // Lists every save PKSM-Core recognizes as Gen 1-7. Slow-ish: reads each candidate.
