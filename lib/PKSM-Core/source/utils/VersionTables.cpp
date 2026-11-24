@@ -30,6 +30,8 @@
 #include <algorithm>
 #include <functional>
 
+//DeviousKyo
+
 namespace
 {
     template <typename T>
@@ -83,7 +85,7 @@ namespace
     }
 
     // Dummied-move bitflag arrays, one bit per move ID
-    // Bit set = move is dummied (not usable in that game)
+    // Bit set = move is dummied (unusable in that game)
 
     // SWSH (Gen 8)
     constexpr u8 DummiedMoves_SWSH[] = {
