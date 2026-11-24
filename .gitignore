@@ -1,0 +1,16 @@
+# Build output
+build/
+*.3dsx
+*.elf
+*.smdh
+*.cia
+*.map
+
+# Editor / OS clutter
+.vscode/
+*.swp
+Thumbs.db
+desktop.ini
+
+# Local Claude settings
+.claude/settings.local.json
