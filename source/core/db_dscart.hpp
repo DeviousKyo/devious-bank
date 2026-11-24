@@ -34,8 +34,8 @@ namespace db::dscart
 
     bool read(const CartInfo& cart, std::vector<uint8_t>& out, std::string& err);
 
-    // The inserted cart's 32x32 banner icon, decoded to RGBA8 (0xRRGGBBAA, palette entry 0
-    // transparent) and laid out in the GPU's 8x8-tile Morton order: 4096 bytes.
+    // The inserted cart's 32x32 icon as the system provides it: RGB565 in the GPU's
+    // 8x8-tile Morton order, 2048 bytes.
     bool readIcon(std::vector<uint8_t>& out);
 
     // Writes `image` over a save whose current contents must equal `expected`.

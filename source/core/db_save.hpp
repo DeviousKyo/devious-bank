@@ -32,8 +32,8 @@ namespace db
     // The game's own icon, read from the console (no bundled art):
     //   Smdh48 - 3DS titles and Virtual Console: the HOME Menu icon, 48x48 RGB565, already
     //            in the GPU's 8x8-tile Morton order (0x1200 bytes)
-    //   Ds32   - DS cartridges: the banner icon, decoded to 32x32 RGBA8 in GPU tile order
-    //            (4096 bytes)
+    //   Ds32   - DS cartridges: the banner icon as the system converts it, 32x32 RGB565
+    //            in GPU tile order (0x800 bytes)
     // SD .sav files have no icon anywhere on the console: None.
     enum class IconKind : uint8_t
     {

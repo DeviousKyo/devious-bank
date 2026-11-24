@@ -33,10 +33,10 @@ namespace db::ui
                 e->ok = true;
             }
         }
-        else if (loc.iconKind == IconKind::Ds32 && loc.icon.size() == 32 * 32 * 4)
+        else if (loc.iconKind == IconKind::Ds32 && loc.icon.size() == 32 * 32 * 2)
         {
-            // 32x32 RGBA8, already tiled by the decoder: fills the whole texture.
-            if ((e->texInit = C3D_TexInit(&e->tex, 32, 32, GPU_RGBA8)))
+            // 32x32 RGB565, already in GPU tile order: fills the whole texture.
+            if ((e->texInit = C3D_TexInit(&e->tex, 32, 32, GPU_RGB565)))
             {
                 std::memcpy(e->tex.data, loc.icon.data(), loc.icon.size());
                 e->sub = Tex3DS_SubTexture{32, 32, 0.0f, 1.0f, 1.0f, 0.0f};
