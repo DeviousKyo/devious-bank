@@ -49,6 +49,9 @@ namespace db::trade
         MSG_READY     = 6, // same payload as CONFIRM
         MSG_BYE       = 7, // -
         MSG_PING      = 8, // - (heartbeat every 2 s; 15 s of silence ends the session)
+        MSG_SAVING    = 9, // - (sender is about to block on a long save: the receiver allows
+                           //    90 s of silence until the sender's next message)
+        // Unknown types are ignored, so older builds simply don't extend their limit.
     };
 
     class Session
@@ -79,6 +82,13 @@ namespace db::trade
         void update();
         // Says goodbye (if connected) and closes everything. Phase becomes Ended.
         void leave();
+        // Call right after the main loop was blocked for a while (a save, the HOME menu):
+        // restarts the heartbeat clocks and pings the partner at once, so neither side
+        // takes the stall for a lost partner.
+        void touch();
+        // Call right BEFORE a call that may block for a long time (saving to the SD card or
+        // a cartridge): tells the partner to wait up to 90 s for us instead of 15 s.
+        void announceLongPause();
 
         [[nodiscard]] Role role() const { return myRole; }
         [[nodiscard]] Phase phase() const { return state; }
@@ -120,6 +130,8 @@ namespace db::trade
         void tryLock();
         void tryCommit();
         void end(const std::string& why);
+        // Gives queued bytes up to `ms` to leave (bounded wait while pendingSend()).
+        void flushOutgoing(uint64_t ms);
         [[nodiscard]] uint32_t crcMine() const;
         [[nodiscard]] uint32_t crcTheirs() const;
 
@@ -142,5 +154,6 @@ namespace db::trade
         bool isLocked = false, partnerReady = false;
         std::string partnerLeft; // BYE that arrived after commit; ends the session afterwards
         uint64_t lastPingSent = 0, lastHeard = 0; // heartbeat (osGetTime ms)
+        bool partnerSaving = false; // got MSG_SAVING, nothing since: allow the long silence
     };
 }

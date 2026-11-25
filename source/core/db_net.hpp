@@ -104,6 +104,9 @@ namespace db::net
         [[nodiscard]] const std::string& peerIp() const { return peer; }
         // True while queued bytes haven't been handed to the network yet.
         [[nodiscard]] bool pendingSend() const { return !outBuf.empty(); }
+        // osGetTime() of the last poll() that read any bytes from the partner (0 if none
+        // yet). Proof of life, even before those bytes make up a whole message.
+        [[nodiscard]] uint64_t lastReceiveTime() const { return lastRx; }
 
         // Queues and sends a message (best effort non-blocking; partial writes are kept and
         // flushed on later poll() calls). False if not connected or payload too large.
@@ -129,6 +132,7 @@ namespace db::net
         int listenSock   = -1;
         int sock         = -1;
         uint64_t started = 0;
+        uint64_t lastRx  = 0; // osGetTime() when bytes last arrived
         uint32_t target  = 0; // guest: host address (network byte order), to re-check connect
         std::string err;
         std::string peer;

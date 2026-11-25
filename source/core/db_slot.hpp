@@ -58,7 +58,8 @@ namespace db
 
         // Parses a copy of the bytes for display. Null for empty or unparseable slots.
         [[nodiscard]] std::unique_ptr<pksm::PKX> toPkx() const;
-        // Copies the decrypted bytes of a Pokemon read from a save. Species None -> Empty.
+        // Copies the decrypted bytes of a Pokemon read from a save. Species None -> Empty only
+        // if the record is genuinely blank; a damaged one is kept and flagged SLOT_CORRUPT.
         [[nodiscard]] static Slot fromPkx(const pksm::PKX& pk);
     };
 

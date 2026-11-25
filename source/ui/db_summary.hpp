@@ -15,6 +15,7 @@ namespace db::ui
         bool bad     = false;
         bool shiny   = false;
         bool egg     = false;
+        bool locked  = false; // SLOT_LOCKED, e.g. slots 21-30 of international Gen 1/2 boxes
         int level    = 0;
         int iconKey  = -1; // species number, ICON_EGG, or ICON_NONE
         std::string name;

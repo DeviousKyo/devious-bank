@@ -63,9 +63,15 @@ namespace db
         [[nodiscard]] const std::string& readOnlyReason() const { return roReason; }
         [[nodiscard]] const std::string& backupPath() const { return backup; }
         [[nodiscard]] bool dirty() const;
+        // False (with a short reason) if this Pokemon can't be written into this save with
+        // its bytes unchanged: wrong generation, or a Gen 1/2 record from the other language
+        // family (Japanese vs international), whose names PKSM-Core would rewrite.
+        [[nodiscard]] bool canHold(const Slot& s, std::string& why) const;
 
         // Writes every dirty slot into the save, recomputes checksums/signatures
         // (PKSM-Core finishEditing), writes it back, and verifies by re-reading.
+        // On any failure the in-memory save is put back exactly as it was before the
+        // attempt, and the boxes and dirty flags are kept, so calling it again retries.
         bool commit(std::string& err);
 
     private:
@@ -81,6 +87,8 @@ namespace db
         static PartySnapshot snapshotParty(const pksm::Sav& s);
 
         SaveSource() = default;
+        // Usable slots per box: 20 for international Gen 1/2, otherwise 30.
+        [[nodiscard]] int slotsPerBox() const;
         void rebuildBoxes();
         PartySnapshot party;
 

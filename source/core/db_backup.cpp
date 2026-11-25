@@ -21,6 +21,13 @@ namespace db
         {
             candidate = dir + "_" + std::to_string(n);
         }
+        if (fs::exists(candidate))
+        {
+            // Every suffix is taken: writing into an existing folder could replace an
+            // older backup, so give up instead.
+            res.error = "Too many backups this second: " + dir;
+            return res;
+        }
         dir = candidate;
 
         if (!fs::mkdirs(dir))

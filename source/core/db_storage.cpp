@@ -53,6 +53,27 @@ namespace db
         return false;
     }
 
+    bool Storage::accepts(Pane p, const Slot& s, std::string* why) const
+    {
+        if (s.empty() || p == Pane::Bank)
+        {
+            return true;
+        }
+        if (!accepts(p, s.format, why))
+        {
+            return false;
+        }
+        // Same generation is not always enough: a Gen 1/2 record from the other language
+        // family would have its names rewritten by PKSM-Core on the way in.
+        std::string reason;
+        if (!save->canHold(s, reason))
+        {
+            if (why) *why = reason;
+            return false;
+        }
+        return true;
+    }
+
     bool Storage::swap(const SlotRef& a, const SlotRef& b, std::string& why)
     {
         if (a == b)
@@ -76,7 +97,7 @@ namespace db
             why = "That slot is locked or damaged";
             return false;
         }
-        if (!accepts(b.pane, sa.format, &why) || !accepts(a.pane, sb.format, &why))
+        if (!accepts(b.pane, sa, &why) || !accepts(a.pane, sb, &why))
         {
             return false;
         }
@@ -132,7 +153,7 @@ namespace db
                 why = "Not enough empty spots there";
                 return false;
             }
-            if (!accepts(b.pane, src.format, &why))
+            if (!accepts(b.pane, src, &why))
             {
                 return false;
             }
@@ -173,7 +194,7 @@ namespace db
             why = "The offered Pokemon is no longer in its slot";
             return false;
         }
-        if (!s.movable() || !accepts(where.pane, incoming.format, &why))
+        if (!s.movable() || !accepts(where.pane, incoming, &why))
         {
             if (why.empty()) why = "That slot can't take the received Pokemon";
             return false;

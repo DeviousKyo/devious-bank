@@ -6,9 +6,18 @@
 int main()
 {
     db::App app;
-    if (app.init())
+    // An exception escaping init()/run() would skip fini() and leave citro3d, the
+    // sockets and the services up, which hangs the console on the way out. Moves that
+    // weren't saved yet are lost, as with closing from HOME.
+    try
     {
-        app.run();
+        if (app.init())
+        {
+            app.run();
+        }
+    }
+    catch (...)
+    {
     }
     // Always runs, including after a failed init: frees GPU resources and services,
     // then returns to the Homebrew Launcher.

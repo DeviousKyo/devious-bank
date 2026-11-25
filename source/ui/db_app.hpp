@@ -90,6 +90,7 @@ namespace db
             Exit,
             TradeHost, // local Wi-Fi trade: wait for a partner
             TradeJoin, // local Wi-Fi trade: find a host
+            TradeForceLeave, // leave a locked trade whose partner went silent
             Help,
             Back,
         };
@@ -112,6 +113,8 @@ namespace db
         // Closes the open save and shows the game list. `discard` also throws away unsaved
         // bank changes by reloading the bank file.
         void returnToGameList(bool discard);
+        // Hidden (L + R + SELECT on the game list): runs db::selftest and shows the result.
+        void runSelfTest();
 
         // ---- local Wi-Fi trading
         void startTrade(bool host);
@@ -201,6 +204,9 @@ namespace db
         // Stylus: where the touch started (-1 = none) and whether it has dragged.
         int touchStart    = -1;
         bool touchDragged = false;
+        // Whether the stylus was over a tile on the last frame it touched. Releasing reads
+        // no position, so a carried drop decides from this (off the grid = no drop).
+        bool touchOnGrid = false;
 
         std::string status;
         u32 statusColor = ui::col::DIM;

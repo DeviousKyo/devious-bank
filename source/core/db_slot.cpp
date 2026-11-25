@@ -99,13 +99,50 @@ namespace db
         return pksm::PKX::getPKM(formatToGeneration(format), copy.data(), length, false);
     }
 
+    // Species None alone doesn't prove a slot is empty: a damaged record can decode to
+    // species 0 too, and treating it as empty would let it be overwritten. A slot counts as
+    // genuinely empty only if:
+    //   - its bytes are all zero. That is what PKSM-Core hands back for real empty slots:
+    //     Gen 1/2 return emptyPkm() (zero-filled) for slots past the box's count; Gen 3+
+    //     empty box data is zeros, or blank data encrypted with key 0, which the PKX
+    //     constructor decrypts back to zeros (all-zero data is not "encrypted" for any
+    //     isEncrypted(), so it stays zeros).
+    //   - or (Gen 3+ only) its checksum is valid: an intact record whose species is 0 is a
+    //     blank the game itself treats as empty, not a damaged Pokemon.
+    // Anything else (Gen 1/2 listed entries with an invalid species, Gen 3+ species 0 with a
+    // bad checksum) keeps its bytes and is flagged SLOT_CORRUPT.
+    static bool genuinelyEmpty(const pksm::PKX& pk, PkxFormat f)
+    {
+        auto raw = pk.rawData();
+        if (std::all_of(raw.begin(), raw.end(), [](uint8_t b) { return b == 0; }))
+        {
+            return true;
+        }
+        if (f >= PkxFormat::PK3)
+        {
+            auto check = pk.clone();
+            check->refreshChecksum();
+            return check->checksum() == pk.checksum();
+        }
+        return false;
+    }
+
     Slot Slot::fromPkx(const pksm::PKX& pk)
     {
         Slot s;
         PkxFormat f;
-        if (pk.species() == pksm::Species::None || !formatFromGeneration(pk.generation(), f))
+        if (!formatFromGeneration(pk.generation(), f))
         {
             return s; // empty
+        }
+        const bool noSpecies = pk.species() == pksm::Species::None;
+        if (noSpecies && genuinelyEmpty(pk, f))
+        {
+            return s; // empty
+        }
+        if (noSpecies)
+        {
+            s.flags |= SLOT_CORRUPT; // damaged record: kept as is, never overwritten
         }
 
         auto raw = pk.rawData();
@@ -113,7 +150,7 @@ namespace db
         {
             // PKSM-Core decrypts on construction; refuse to store anything else.
             s.format = f;
-            s.flags  = SLOT_CORRUPT;
+            s.flags |= SLOT_CORRUPT;
         }
 
         size_t len = boxLength(f, raw.size());

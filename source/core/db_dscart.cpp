@@ -134,7 +134,7 @@ namespace db::dscart
     }
 
     bool write(const CartInfo& cart, const uint8_t* image, size_t len,
-        const std::vector<uint8_t>& expected, std::string& err)
+        std::vector<uint8_t>& expected, std::string& err)
     {
         // 1. Same cart, same chip?
         CartInfo now;
@@ -179,7 +179,24 @@ namespace db::dscart
             }
             if (R_FAILED(SPIWriteSaveData(type, pos, (void*)(image + pos), end - pos)))
             {
-                err = "Writing the DS cart failed";
+                // Some pages may already hold new data. Record what the cart really holds
+                // now, so a retry compares against the actual contents instead of being
+                // refused forever as "changed since it was opened".
+                std::string readErr;
+                std::vector<uint8_t> now;
+                if (read(cart, now, readErr) && now.size() == len)
+                {
+                    expected = std::move(now);
+                    err = "Writing the DS cart failed partway; the cart may hold a mix of old "
+                          "and new data. Retry saving; if that also fails, restore the backup";
+                }
+                else
+                {
+                    // Contents unknown: `expected` stays stale, so no retry can write over
+                    // something nobody has looked at.
+                    err = "Writing the DS cart failed partway and the cart could not be re-read; "
+                          "restore the backup";
+                }
                 return false;
             }
             pos = end;
@@ -189,13 +206,22 @@ namespace db::dscart
         std::vector<uint8_t> check;
         if (!read(cart, check, err))
         {
+            err = "The DS cart could not be read back after writing; restore the backup if "
+                  "the game save is damaged";
             return false;
         }
         if (check.size() != len || std::memcmp(check.data(), image, len) != 0)
         {
-            err = "DS cart verification failed after writing";
+            // What was read back is what the cart holds; let a retry start from it.
+            if (check.size() == len)
+            {
+                expected = std::move(check);
+            }
+            err = "DS cart verification failed after writing. Retry saving; if that also "
+                  "fails, restore the backup";
             return false;
         }
+        expected = std::move(check);
         return true;
     }
 }

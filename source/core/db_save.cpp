@@ -5,6 +5,7 @@
 #include "sav/SaveRecognition.hpp"
 #include "utils/i18n.hpp"
 
+#include <algorithm>
 #include <cstring>
 #include <dirent.h>
 #include <sys/stat.h>
@@ -249,6 +250,17 @@ namespace db
                 {
                     continue;
                 }
+                // writeFileAtomic leaves <name>.bak (previous version) and, after a failed
+                // write, <name>.tmp next to each save; they are not saves of their own.
+                const auto endsWith = [&name](const char* ext)
+                {
+                    const size_t n = std::strlen(ext);
+                    return name.size() >= n && name.compare(name.size() - n, n, ext) == 0;
+                };
+                if (endsWith(".bak") || endsWith(".tmp"))
+                {
+                    continue;
+                }
                 std::string full = std::string(fs::SAVES_DIR) + "/" + name;
                 struct stat st;
                 if (stat(full.c_str(), &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0 &&
@@ -331,9 +343,10 @@ namespace db
             return arch && archiveRead(arch.get(), loc.path, out);
         }
 
-        // `expected`: what the medium held when last read (DS carts check it before writing).
+        // `expected`: what the medium held when last read (DS carts check it before writing,
+        // and update it to what the cart really holds after a write that failed partway).
         bool writeLocation(const SaveLocation& loc, const uint8_t* data, size_t len,
-            const std::vector<uint8_t>& expected, std::string& err)
+            std::vector<uint8_t>& expected, std::string& err)
         {
             if (loc.medium == SaveMedium::SdFile)
             {
@@ -420,9 +433,53 @@ namespace db
         return sav ? gameLabel(*sav) : "?";
     }
 
+    int SaveSource::slotsPerBox() const
+    {
+        // International Gen 1/2 boxes hold 20 (Japanese 30); PKSM-Core's box writes silently
+        // ignore anything past that, so those slots must never take a Pokemon.
+        const int boxesInSave = sav->maxBoxes();
+        const int perBox      = boxesInSave > 0 ? sav->maxSlot() / boxesInSave : 0;
+        return std::clamp(perBox, 0, BOX_SLOTS);
+    }
+
+    bool SaveSource::canHold(const Slot& s, std::string& why) const
+    {
+        if (s.empty())
+        {
+            return true;
+        }
+        if (!sav || s.format != fmt)
+        {
+            why = std::string(formatName(s.format)) + " can't go into a " + formatName(fmt) +
+                  " save";
+            return false;
+        }
+        if (!validLength(s.format, s.length))
+        {
+            why = "That Pokemon's data is damaged";
+            return false;
+        }
+        if (fmt <= PkxFormat::PK2)
+        {
+            // Japanese and international Gen 1/2 records differ in name length, and PKSM-Core
+            // rewrites the nickname and OT when they cross over. Only same-family records
+            // are written byte for byte.
+            const size_t want = sav->emptyPkm()->rawData().size();
+            if (s.length != want)
+            {
+                why = s.length < want
+                          ? "A Japanese Gen 1/2 Pokemon can't go into an international save"
+                          : "An international Gen 1/2 Pokemon can't go into a Japanese save";
+                return false;
+            }
+        }
+        return true;
+    }
+
     void SaveSource::rebuildBoxes()
     {
-        const int count = sav->maxBoxes();
+        const int count    = sav->maxBoxes();
+        const int capacity = slotsPerBox();
         boxes.assign(count, Box{});
         for (int b = 0; b < count; b++)
         {
@@ -433,6 +490,12 @@ namespace db
             }
             for (int s = 0; s < BOX_SLOTS; s++)
             {
+                if (s >= capacity)
+                {
+                    // Not part of the game's box: shown as unusable so nothing goes there.
+                    boxes[b].slots[s].flags = SLOT_LOCKED;
+                    continue;
+                }
                 auto pk = sav->pkm((u8)b, (u8)s);
                 if (pk)
                 {
@@ -469,6 +532,9 @@ namespace db
             return false;
         }
 
+        // ---- validate every dirty slot before touching the save
+        const int capacity = slotsPerBox();
+        std::vector<std::unique_ptr<pksm::PKX>> parsed(boxCount() * BOX_SLOTS);
         for (int b = 0; b < boxCount(); b++)
         {
             for (int s = 0; s < BOX_SLOTS; s++)
@@ -477,31 +543,79 @@ namespace db
                 {
                     continue;
                 }
+                if (s >= capacity)
+                {
+                    // PKSM-Core would silently drop it: the Pokemon would vanish on save.
+                    err = "Internal error: box " + std::to_string(b + 1) + " slot " +
+                          std::to_string(s + 1) + " is past the game's box size; nothing "
+                          "was written";
+                    return false;
+                }
                 const Slot& slot = boxes[b].slots[s];
                 if (slot.empty())
                 {
-                    sav->pkm(*sav->emptyPkm(), (u8)b, (u8)s, false);
                     continue;
                 }
-                if (slot.format != fmt)
+                std::string why;
+                if (!canHold(slot, why))
                 {
-                    err = "Internal error: wrong format in box " + std::to_string(b + 1);
+                    err = "Box " + std::to_string(b + 1) + ": " + why + "; nothing was written";
                     return false;
                 }
                 auto pk = slot.toPkx();
                 if (!pk)
                 {
-                    err = "Could not parse Pokemon for box " + std::to_string(b + 1);
+                    err = "Could not parse Pokemon for box " + std::to_string(b + 1) +
+                          "; nothing was written";
                     return false;
                 }
+                parsed[b * BOX_SLOTS + s] = std::move(pk);
+            }
+        }
+
+        // The save exactly as it is before this attempt. Any failure from here on puts it
+        // back, so the in-memory save matches `boxes` again (Gen 1/2 finishEditing compacts
+        // the box lists, which would shift every index) and a retry re-applies the same
+        // moves from the dirty flags, which are left as they are.
+        // Taken from `onMedium` (the exact file last read from / written to the medium)
+        // rather than from `buffer`: the in-memory save is never changed outside commit(),
+        // so the two describe the same save, but `onMedium` is guaranteed to be in on-disk
+        // form and therefore always re-parses. Copied now, before writeLocation() can update
+        // `onMedium` to a partly written DS cart.
+        const std::vector<uint8_t> before = onMedium;
+        const auto restore = [this, &before]()
+        {
+            std::shared_ptr<u8[]> restoredBuf;
+            auto restored = parse(before, restoredBuf);
+            if (!restored)
+            {
+                // Can't happen (these bytes parsed before); never write from a bad state.
+                roReason = "Could not restore the save after a failed write. Reopen the save.";
+                return;
+            }
+            // The Sav keeps its own reference to its buffer, so the order doesn't matter.
+            sav    = std::move(restored);
+            buffer = std::move(restoredBuf);
+        };
+
+        for (int b = 0; b < boxCount(); b++)
+        {
+            for (int s = 0; s < BOX_SLOTS; s++)
+            {
+                if (!boxes[b].dirty[s])
+                {
+                    continue;
+                }
+                const auto& pk = parsed[b * BOX_SLOTS + s];
                 // applyTrade = false: the Pokemon's bytes are written exactly as stored.
-                sav->pkm(*pk, (u8)b, (u8)s, false);
+                sav->pkm(pk ? *pk : *sav->emptyPkm(), (u8)b, (u8)s, false);
             }
         }
 
         // Party guard 1: the box writes above must not have touched the party.
         if (!(snapshotParty(*sav) == party))
         {
+            restore();
             roReason = "Party check failed before saving; nothing was written. Reopen the save.";
             err      = roReason;
             return false;
@@ -519,7 +633,7 @@ namespace db
             auto check = parse(image, checkBuf);
             if (!check || !(snapshotParty(*check) == party))
             {
-                sav->beginEditing();
+                restore();
                 roReason = "Party check failed on the final save image; nothing was written. "
                            "Reopen the save.";
                 err = roReason;
@@ -532,15 +646,16 @@ namespace db
         if (ok)
         {
             std::vector<uint8_t> check;
-            ok = readLocation(loc, check) && check.size() == len &&
-                 fs::crc32(check.data(), len) == crc;
-            if (ok)
+            const bool readBack = readLocation(loc, check);
+            ok = readBack && check.size() == len && fs::crc32(check.data(), len) == crc;
+            if (readBack)
             {
-                onMedium = std::move(check);
+                onMedium = std::move(check); // whatever is really there now
             }
-            else
+            if (!ok)
             {
-                err = "Save written but verification failed. Backup: " + backup;
+                err = "Save written but verification failed. Retry saving; if that also "
+                      "fails, restore the backup: " + backup;
             }
         }
         else
@@ -548,12 +663,14 @@ namespace db
             err = (writeErr.empty() ? std::string("Writing the save failed") : writeErr) +
                   ". Backup: " + backup;
         }
-        sav->beginEditing();
 
-        if (ok)
+        if (!ok)
         {
-            rebuildBoxes(); // reflects Gen 1/2 compaction; clears dirty flags
+            restore(); // boxes and dirty flags untouched: a retry writes the same moves
+            return false;
         }
-        return ok;
+        sav->beginEditing();
+        rebuildBoxes(); // reflects Gen 1/2 compaction; clears dirty flags
+        return true;
     }
 }

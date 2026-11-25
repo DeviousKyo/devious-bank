@@ -1,5 +1,6 @@
 #include "ui/db_app.hpp"
 #include "core/db_fs.hpp"
+#include "core/db_selftest.hpp"
 
 #include "utils/i18n.hpp"
 
@@ -155,6 +156,10 @@ namespace db
         // every archive/file handle is scoped to a single read or write).
         tradeSession.reset(); // says goodbye to a trade partner and closes its sockets
         net::stop();          // SOC service + its buffer
+        // A trade (or an exception out of one) may have left these blocked; APT keeps the
+        // setting after we exit, so the Homebrew Launcher would inherit it.
+        aptSetSleepAllowed(true);
+        aptSetHomeAllowed(true);
         storage.reset();
         save.reset();
         icons.clear();  // icon textures, before citro3d goes away
@@ -238,7 +243,9 @@ namespace db
         group.reset();
         sel.reset();
         ySelecting = false;
-        touchStart = -1;
+        touchStart   = -1;
+        touchDragged = false;
+        C3D_FrameSync(); // the last frame may still be drawing the game art on the GPU
         gameArt.clear(); // not shown in the boxes; free them
 
         if (listCursor > 0)
@@ -281,22 +288,62 @@ namespace db
 
     bool App::saveAll(std::string& err)
     {
-        // HOME is blocked while writing so the app cannot be suspended mid-write.
+        // HOME is blocked while writing so the app cannot be suspended mid-write. Put back
+        // whatever it was before: a locked trade keeps HOME blocked after the save too.
+        const bool homeWasAllowed = aptIsHomeAllowed();
         aptSetHomeAllowed(false);
         progressFrame("Saving... do not power off");
 
         // Bank first: its writes are atomic, and a deposited Pokemon then exists in the
         // bank before it is removed from the game save.
-        bool ok = true;
-        if (bank.dirty() && !bank.save(err))
+        bool ok          = true;
+        bool bankWritten = false;
+        if (bank.dirty())
         {
-            ok = false;
+            ok          = bank.save(err);
+            bankWritten = ok;
         }
+        bool rollbackFailed = false;
+        bool commitFailed   = false;
         if (ok && save && save->dirty() && !save->commit(err))
         {
-            ok = false;
+            ok           = false;
+            commitFailed = true;
+            // The two files must change together. With only the bank written, a withdrawn
+            // Pokemon would be in neither file and a deposited one in both, and "exit
+            // without saving" would make that permanent. Put the bank file back; the moves
+            // stay in memory (and the bank dirty) so the user can simply retry.
+            if (bankWritten)
+            {
+                std::string err2;
+                if (!bank.rollbackLastSave(err2))
+                {
+                    rollbackFailed = true;
+                    bank.markDirty(); // a retry must write the bank again, whatever is on disk
+                    err += "\nThe bank file was already updated and could NOT be put back (" +
+                           err2 +
+                           "), so the bank and the game save don't match. Save again to "
+                           "retry; don't exit without saving. Backups of both are in "
+                           "sdmc:/3ds/DB/backups/";
+                }
+            }
         }
-        aptSetHomeAllowed(true);
+        if (!ok && !rollbackFailed && commitFailed)
+        {
+            // The bank is back as it was, but a game save write (a DS cart above all) can
+            // fail partway, so don't promise that file is untouched.
+            err += "\nThe bank file was left unchanged and your moves are still here. The "
+                   "game save write failed and may be incomplete: save again to retry. The "
+                   "original game save is in sdmc:/3ds/DB/backups/";
+        }
+        else if (!ok && !rollbackFailed)
+        {
+            // The bank failed first (its writes are atomic) and the game save wasn't touched.
+            err += "\nNothing was written and your moves are still here. Save again to "
+                   "retry, or exit without saving to keep the files unchanged. Backups are "
+                   "in sdmc:/3ds/DB/backups/";
+        }
+        aptSetHomeAllowed(homeWasAllowed);
         invalidate();
         return ok;
     }
@@ -354,6 +401,9 @@ namespace db
         menuTitle  = "Menu";
         menuCursor = 0;
         state      = State::Menu;
+        // A stylus still down when the menu opened must not act on the boxes on release.
+        touchStart   = -1;
+        touchDragged = false;
     }
 
     void App::runMenuAction(MenuAction a)
@@ -370,10 +420,7 @@ namespace db
                 else
                 {
                     state = State::BoxView;
-                    showMessage("Save failed: " + err +
-                                    "\nNothing was lost: your moves are still here and the "
-                                    "backups are in sdmc:/3ds/DB/backups/",
-                        true);
+                    showMessage("Save failed: " + err, true); // saveAll says what was kept
                 }
                 break;
             }
@@ -393,10 +440,7 @@ namespace db
                 else
                 {
                     state = State::BoxView;
-                    showMessage("Save failed: " + err +
-                                    "\nNothing was lost: your moves are still here and the "
-                                    "backups are in sdmc:/3ds/DB/backups/",
-                        true);
+                    showMessage("Save failed: " + err, true); // saveAll says what was kept
                 }
                 break;
             }
@@ -410,12 +454,26 @@ namespace db
             case MenuAction::TradeJoin:
                 startTrade(false);
                 break;
+            case MenuAction::TradeForceLeave:
+            {
+                // A locked session never times out (it could be about to commit), so this is
+                // the only way out when the partner disappears. Copy the log path first:
+                // leaveTrade destroys the session that owns it.
+                const std::string log = tradeSession ? tradeSession->tradeLogPath() : "";
+                leaveTrade("You left a locked-in trade. It may or may not have completed on "
+                           "the other system. Nothing changed here, and both Pokemon were "
+                           "saved to the trade log: " + log,
+                    true);
+                break;
+            }
             case MenuAction::Help:
                 helpReturn = State::BoxView;
                 state      = State::Help;
                 break;
             case MenuAction::Back:
-                state = State::BoxView;
+                // "Keep waiting" on a locked trade goes back to the trade, where a commit
+                // that arrives is applied and shown.
+                state = tradeSession ? State::Trade : State::BoxView;
                 break;
         }
     }
@@ -452,6 +510,9 @@ namespace db
             showMessage("Can't trade: " + err, true);
             return;
         }
+        // Closing the lid would drop Wi-Fi and stall the partner mid-trade (or mid-commit).
+        // leaveTrade() and fini() allow sleep again.
+        aptSetSleepAllowed(false);
         // The received Pokemon goes where my offer comes from, so that slot's pane decides
         // what can be received (the bank takes any generation; a save only its own).
         tradeSession->setAcceptCheck(
@@ -459,7 +520,7 @@ namespace db
             {
                 if (!tradeRef) return true;
                 if (storage->paneReadOnly(tradeRef->pane, &why)) return false;
-                return storage->accepts(tradeRef->pane, incoming.format, &why);
+                return storage->accepts(tradeRef->pane, incoming, &why); // also JP/intl
             });
         state = State::TradeWait;
     }
@@ -473,6 +534,11 @@ namespace db
             tradeSession->leave();
             tradeSession.reset();
         }
+        // The sockets are closed now: free the SOC service and its 1 MB buffer for the
+        // rest of the session (host() / browse() start it again for the next trade).
+        net::stop();
+        aptSetSleepAllowed(true);
+        aptSetHomeAllowed(true); // pumpTrade blocks HOME while locked
         tradeRef.reset();
         shownMine.reset();
         shownTheirs.reset();
@@ -509,6 +575,18 @@ namespace db
         {
             leaveTrade(tradeSession->endReason(), true);
             return;
+        }
+        // Once locked, suspending to HOME would stall the commit and could let the partner
+        // finish alone; the escape hatch is B (asks first). Only touch APT on a change.
+        if (const bool homeOk = !tradeSession->locked(); aptIsHomeAllowed() != homeOk)
+        {
+            aptSetHomeAllowed(homeOk);
+        }
+        // The session can withdraw my offer by itself (e.g. the partner's check failed);
+        // drop the slot outline with it so it doesn't point at a Pokemon no longer offered.
+        if (!tradeSession->myOffer())
+        {
+            tradeRef.reset();
         }
         // Backstop: a live offer must always match the Pokemon in tradeRef's slot. If it ever
         // doesn't (and we haven't locked yet), withdraw it before it can be traded.
@@ -571,6 +649,12 @@ namespace db
         const std::optional<Slot> incoming = tradeSession->partnerOffer();
         const std::string log              = tradeSession->tradeLogPath();
         const std::string partner          = tradeSession->partnerName();
+        // A commit that lands while the "leave while locked?" menu is open goes to the trade
+        // screen (or a message over it), not back to a leave option that no longer applies.
+        if (state == State::Menu)
+        {
+            state = State::Trade;
+        }
 
         std::string why;
         bool ok = tradeRef && outgoing && incoming &&
@@ -589,10 +673,15 @@ namespace db
             return;
         }
 
-        // Like an in-game trade, a completed trade is saved right away.
+        // Like an in-game trade, a completed trade is saved right away. Saving blocks the
+        // main loop for seconds: warn the partner first, then reset the heartbeat after, so
+        // neither side takes the silence for a dropped connection.
         std::string err;
         const State keep = state;
-        if (saveAll(err))
+        tradeSession->announceLongPause();
+        const bool saved = saveAll(err);
+        tradeSession->touch();
+        if (saved)
         {
             state = keep;
             setStatus("Trade with " + partner + " complete and saved!", col::GOOD);
@@ -645,7 +734,9 @@ namespace db
             swkbdSetNumpadKeys(&kbd, '.', 0);
             swkbdSetHintText(&kbd, "Host's IP address (shown on the host's screen)");
             char buf[16] = {};
-            if (swkbdInputText(&kbd, buf, sizeof(buf)) == SWKBD_BUTTON_CONFIRM)
+            const SwkbdButton pressed = swkbdInputText(&kbd, buf, sizeof(buf));
+            tradeSession->touch(); // the keyboard blocks the main loop while it is open
+            if (pressed == SWKBD_BUTTON_CONFIRM)
             {
                 ip = buf;
             }
@@ -743,8 +834,14 @@ namespace db
         {
             if (tradeSession->locked())
             {
-                setStatus("Locked in - the trade finishes when your partner confirms",
-                    col::DIM);
+                // Locked in: ask first, since leaving now can't tell whether the partner
+                // completed. "Keep waiting" is first so a stray A changes nothing.
+                menu.clear();
+                menu.push_back({"Keep waiting", col::TEXT, MenuAction::Back});
+                menu.push_back({"Leave the trade", col::WARN, MenuAction::TradeForceLeave});
+                menuTitle  = "Leave while locked in?";
+                menuCursor = 0;
+                state      = State::Menu;
             }
             else if (tradeSession->myOffer())
             {
@@ -767,27 +864,61 @@ namespace db
         touchStart = -1;
         storage.reset();
         save.reset(); // the game save's unsaved moves go with it; the file is untouched
+        C3D_FrameSync(); // the last frame may still be drawing these icons on the GPU
         icons.clear();
 
+        std::string err;
         if (discard && bank.dirty())
         {
             // Throw away unsaved bank moves by reloading the file as it is on the SD card.
-            std::string err;
             bank.load(fs::BANK_PATH, err);
-            if (!err.empty())
-            {
-                showMessage(err, bank.readOnly());
-            }
         }
         storage = std::make_unique<Storage>(bank, nullptr);
         status.clear();
         state = State::GameSelect;
         scan(); // the cart in the slot may have changed while the boxes were open
+        // Only now: showMessage remembers the current state to return to, and setting
+        // the state afterwards would replace the message before it was ever shown.
+        if (!err.empty())
+        {
+            showMessage(err, bank.readOnly());
+        }
     }
 
     // =====================================================================================
     // Input
     // =====================================================================================
+
+    void App::runSelfTest()
+    {
+        progressFrame("Running self-test...");
+        const auto results = selftest::runAll();
+
+        int passed = 0;
+        std::string full, failed;
+        for (const auto& r : results)
+        {
+            passed += r.pass ? 1 : 0;
+            full += std::string(r.pass ? "PASS  " : "FAIL  ") + r.name +
+                    (r.detail.empty() ? "" : "  - " + r.detail) + "\n";
+            if (!r.pass)
+            {
+                failed += "\nFAIL: " + r.name + (r.detail.empty() ? "" : " (" + r.detail + ")");
+            }
+        }
+        // Full results on the SD card; the screen shows the summary and the failures.
+        const std::string path = std::string(fs::ROOT_DIR) + "/selftest_results.txt";
+        fs::mkdirs(fs::ROOT_DIR);
+        const bool saved = fs::writeFileVerified(path, (const uint8_t*)full.data(), full.size());
+
+        std::string msg = "Self-test: " + std::to_string(passed) + " of " +
+                          std::to_string(results.size()) + " passed." + failed;
+        if (saved)
+        {
+            msg += "\nFull results: " + path;
+        }
+        showMessage(msg, passed != (int)results.size());
+    }
 
     void App::inputGameSelect(u32 down, u32 repeat)
     {
@@ -801,6 +932,12 @@ namespace db
         if (repeat & KEY_LEFT) colIdx = std::max(0, colIdx - 1);
         listCursor = std::min(entries - 1, row * CARD_COLS + colIdx);
 
+        // Hidden: hold L + R and press SELECT to run the built-in self-test.
+        if ((down & KEY_SELECT) && (hidKeysHeld() & KEY_L) && (hidKeysHeld() & KEY_R))
+        {
+            runSelfTest();
+            return;
+        }
         if (down & KEY_A) openSelected();
         if (down & KEY_Y) scan();
         if (down & KEY_X) state = State::Credits;
@@ -873,6 +1010,7 @@ namespace db
             {
                 touchStart   = c;
                 touchDragged = false;
+                touchOnGrid  = true;
                 cur          = c;
                 summaryValid = false;
             }
@@ -880,6 +1018,7 @@ namespace db
         else if ((keys & KEY_TOUCH) && touchStart >= 0)
         {
             const int c = cellAt(touch);
+            touchOnGrid = c >= 0; // cellAt is -1 over the header and outside the tray
             if (c >= 0 && c != cur)
             {
                 cur          = c;
@@ -894,13 +1033,21 @@ namespace db
         else if (!(keys & KEY_TOUCH) && touchStart >= 0)
         {
             // Released. Carrying: drop here. A plain tap: same as A. A drag that made a
-            // selection: keep it, so A / X / another tap can act on it.
-            if (carrying() || !touchDragged)
+            // selection: keep it, so A / X / another tap can act on it. Carrying but let go
+            // off the grid: the cursor still sits on the last tile crossed, which isn't
+            // where the stylus was aimed, so keep holding instead of dropping there.
+            if (carrying() && !touchOnGrid)
+            {
+                setStatus("Dropped off the grid - still holding (A to place, B to put back)",
+                    col::DIM);
+            }
+            else if (carrying() || !touchDragged)
             {
                 pressA();
             }
             touchStart   = -1;
             touchDragged = false;
+            touchOnGrid  = false;
         }
     }
 
@@ -910,7 +1057,7 @@ namespace db
         if (repeat & KEY_DOWN) menuCursor = (menuCursor + 1) % n;
         if (repeat & KEY_UP) menuCursor = (menuCursor + n - 1) % n;
         if (down & KEY_A) runMenuAction(menu[menuCursor].action);
-        else if (down & (KEY_B | KEY_START)) state = State::BoxView;
+        else if (down & (KEY_B | KEY_START)) runMenuAction(MenuAction::Back);
     }
 
     void App::inputMessage(u32 down)
@@ -930,6 +1077,12 @@ namespace db
         }
 
         const SlotRef here = cursorRef();
+        if (const Slot& target = storage->at(here); target.empty() && (target.flags & SLOT_LOCKED))
+        {
+            // Slots 21-30 of an international Gen 1/2 box: the game has nowhere to put them.
+            setStatus("This box only holds 20 Pokemon in this game", col::WARN);
+            return;
+        }
         if (held)
         {
             std::string why;
@@ -963,8 +1116,10 @@ namespace db
             setStatus("This slot is damaged/locked and can't be moved", col::WARN);
             return;
         }
-        held     = here;
-        heldIcon = cells[here.slot].iconKey;
+        held = here;
+        // From the slot itself, not the cells cache: L/R/SELECT earlier this frame may have
+        // changed the box or pane without the cache being rebuilt yet.
+        heldIcon = buildCell(s).iconKey;
         invalidate();
         setStatus("Holding - A to place, X to send, B to put back", col::MODE_HOLD);
     }
@@ -993,7 +1148,7 @@ namespace db
                 return;
             }
             g.slots.push_back(i);
-            g.iconKeys.push_back(cells[i].iconKey);
+            g.iconKeys.push_back(buildCell(s).iconKey); // not `cells`: it may be stale
             g.minRow = std::min(g.minRow, i / BOX_COLS);
             g.minCol = std::min(g.minCol, i % BOX_COLS);
         }
@@ -1161,6 +1316,9 @@ namespace db
         if (n <= 0) return;
         boxIdx[paneIdx()] = (boxIdx[paneIdx()] + delta + n) % n;
         clearSelection(); // a selection belongs to one box; a carried group comes along
+        // A drag in progress started on a tile of the old box; it no longer means anything.
+        touchStart   = -1;
+        touchDragged = false;
         invalidate();
     }
 
@@ -1173,6 +1331,8 @@ namespace db
         }
         pane = pane == Pane::Save ? Pane::Bank : Pane::Save;
         clearSelection();
+        touchStart   = -1; // a drag in progress belonged to the other pane
+        touchDragged = false;
         invalidate();
     }
 
@@ -1299,6 +1459,9 @@ namespace db
             (state == State::Message &&
                 (messageReturn == State::GameSelect || messageReturn == State::Credits));
 
+        // beginFrame (C3D_FRAME_SYNCDRAW) waits for the previous frame to finish on the
+        // GPU, so only after it may refreshCaches() free icon textures that frame used.
+        gfx.beginFrame();
         if (listScreens)
         {
             snow.update();
@@ -1307,8 +1470,6 @@ namespace db
         {
             refreshCaches();
         }
-
-        gfx.beginFrame();
 
         gfx.drawTop();
         if (listScreens)
@@ -1323,7 +1484,8 @@ namespace db
             renderTradeWait();
         }
         else if (state == State::Trade ||
-                 (state == State::Message && messageReturn == State::Trade))
+                 (state == State::Message && messageReturn == State::Trade) ||
+                 (state == State::Menu && tradeSession)) // "leave while locked?" confirm
         {
             renderTradeTop();
             renderStatusBar();
@@ -1547,7 +1709,7 @@ namespace db
         std::string hint;
         if (state == State::Trade && tradeSession)
             hint = tradeSession->locked()
-                       ? "Locked in - waiting for your partner to confirm"
+                       ? "Locked in - waiting for your partner  B leave (asks first)"
                        : (tradeSession->myOffer()
                               ? "A offer a different one  Y confirm trade  B withdraw offer"
                               : "A offer the Pokemon under the cursor  B leave the trade");
@@ -1650,11 +1812,23 @@ namespace db
             else if (marked)
                 gfx.rect(x - 2, y - 2, TILE_W + 4, TILE_H + 4, col::MODE_SELECT);
 
+            // A locked empty slot doesn't exist in the game (international Gen 1/2 boxes
+            // hold 20): draw it sunk into the tray with stripes, and never highlight it as
+            // a place to put something.
+            const bool unusable = c.locked && !c.present;
             u32 bg = col::CELL;
-            if (c.bad) bg = col::CELL_BAD;
+            if (unusable) bg = col::CELL_HELD;
+            else if (c.bad) bg = col::CELL_BAD;
             else if (hover) bg = col::CELL_HOVER;
             else if (c.present && !origin) bg = col::CELL_FULL;
             gfx.rect(x, y, TILE_W, TILE_H, bg);
+            if (unusable)
+            {
+                for (int k = 4; k < TILE_H; k += 6)
+                {
+                    gfx.rect(x + 2, y + k, TILE_W - 4, 1, col::TRAY);
+                }
+            }
             if (marked)
             {
                 gfx.rect(x + 2, y + 2, TILE_W - 4, TILE_H - 4, col::SELECT_TINT);
@@ -1987,8 +2161,16 @@ namespace db
 
     void App::renderMessage()
     {
-        const auto lines = wrap(message, 52);
-        const int h      = 40 + (int)lines.size() * 16;
+        // leaveTrade can append to a message already on screen; 11 lines is what fits
+        // between the margins with the "A: OK" line, so cut the rest and say so.
+        constexpr size_t MAX_LINES = 11;
+        auto lines = wrap(message, 52);
+        if (lines.size() > MAX_LINES)
+        {
+            lines.resize(MAX_LINES);
+            lines.back() += " ...";
+        }
+        const int h = 40 + (int)lines.size() * 16;
         const int y0     = std::max(10, (SCREEN_H - h) / 2);
         gfx.rect(0, 0, TOP_W, SCREEN_H, col::OVERLAY);
         gfx.rect(18, y0 - 2, TOP_W - 36, h + 4, messageError ? col::WARN : col::GOOD);

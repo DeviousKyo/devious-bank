@@ -45,6 +45,13 @@ namespace db
         bool load(const std::string& path, std::string& err);
         // Backs up the previous bank file once per session, then writes atomically.
         bool save(std::string& err);
+        // Undoes the last successful save() on disk: puts bank.dbk (and bank.dbk.bak) back
+        // exactly as they were before it, or removes bank.dbk if there was none, and
+        // verifies the result. The in-memory bank keeps the user's moves and is marked
+        // dirty again (with its per-box dirty flags) so a later save() retries them.
+        // Used when the game save written after the bank fails. Only valid right after a
+        // successful save(); returns false otherwise or if the files could not be put back.
+        bool rollbackLastSave(std::string& err);
 
         [[nodiscard]] int boxCount() const { return (int)boxes.size(); }
         [[nodiscard]] Box& box(int i) { return boxes[i]; }
@@ -60,6 +67,18 @@ namespace db
 
     private:
         void createDefault(int count);
+
+        // What the last successful save() replaced, for rollbackLastSave().
+        struct Rollback
+        {
+            bool valid   = false;
+            bool hadMain = false;
+            std::vector<uint8_t> main; // previous bank.dbk
+            bool hadBak = false;
+            std::vector<uint8_t> bak; // previous bank.dbk.bak, if it existed and was readable
+            std::vector<std::array<bool, BOX_SLOTS>> dirty; // per-box flags save() cleared
+        };
+        Rollback last;
 
         std::vector<Box> boxes;
         std::string path;

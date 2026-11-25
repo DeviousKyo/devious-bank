@@ -38,8 +38,11 @@ namespace db
         [[nodiscard]] Box& box(Pane p, int i);
         [[nodiscard]] Slot& at(const SlotRef& r);
         [[nodiscard]] bool paneReadOnly(Pane p, std::string* why = nullptr) const;
-        // Whether a Pokemon of this format may live in the pane.
+        // Whether a Pokemon of this format may live in the pane (format only).
         [[nodiscard]] bool accepts(Pane p, PkxFormat f, std::string* why = nullptr) const;
+        // Whether this exact Pokemon may be written into the pane with its bytes unchanged:
+        // the format check plus SaveSource::canHold (Gen 1/2 language family).
+        [[nodiscard]] bool accepts(Pane p, const Slot& s, std::string* why = nullptr) const;
 
         // Exchanges the contents of two slots (either may be empty). Validates both
         // directions first; on failure nothing is changed and `why` says what was wrong.

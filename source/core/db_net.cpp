@@ -446,6 +446,7 @@ namespace db::net
         }
 
         bool closedByPeer = false;
+        bool gotBytes     = false;
         uint8_t chunk[2048];
         for (;;)
         {
@@ -453,6 +454,7 @@ namespace db::net
             if (n > 0)
             {
                 inBuf.insert(inBuf.end(), chunk, chunk + n);
+                gotBytes = true;
                 continue;
             }
             if (n == 0)
@@ -472,6 +474,12 @@ namespace db::net
             // partner's last message may be among them), then fail below.
             closedByPeer = true;
             break;
+        }
+        if (gotBytes)
+        {
+            // Stamped at read time: after a long stall in the main loop this is "now", so
+            // the partner isn't taken for silent just because we weren't listening.
+            lastRx = osGetTime();
         }
 
         // Split complete frames off the front of inBuf.
@@ -581,6 +589,7 @@ namespace db::net
         err.clear();
         peer.clear();
         started = 0;
+        lastRx  = 0;
         state   = State::Idle;
     }
 }

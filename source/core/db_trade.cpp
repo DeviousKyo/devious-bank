@@ -178,12 +178,7 @@ namespace db::trade
             // Say goodbye, and give anything still queued (e.g. a READY that went out in
             // pieces) up to half a second to leave before the socket closes.
             conn.send(MSG_BYE, nullptr, 0);
-            const uint64_t until = osGetTime() + 500;
-            while (conn.connected() && conn.pendingSend() && osGetTime() < until)
-            {
-                conn.poll();
-                svcSleepThread(10 * 1000 * 1000LL); // 10 ms
-            }
+            flushOutgoing(500);
         }
         conn.close();
         beacon.reset();
@@ -202,6 +197,42 @@ namespace db::trade
         beacon.reset();
         discovery.reset();
         state = Phase::Ended;
+    }
+
+    void Session::flushOutgoing(uint64_t ms)
+    {
+        // poll() also reads, so this can queue partner messages in the inbox; they are only
+        // handled by update(), never here.
+        const uint64_t until = osGetTime() + ms;
+        while (conn.connected() && conn.pendingSend() && osGetTime() < until)
+        {
+            conn.poll();
+            svcSleepThread(10 * 1000 * 1000LL); // 10 ms
+        }
+    }
+
+    void Session::touch()
+    {
+        // Only the clocks and a PING: no protocol state changes, so this is safe in any
+        // phase (also right after a commit, before or after completeCommit()).
+        const uint64_t now = osGetTime();
+        lastHeard          = now;
+        lastPingSent       = now;
+        if (conn.connected())
+        {
+            conn.send(MSG_PING, nullptr, 0);
+        }
+    }
+
+    void Session::announceLongPause()
+    {
+        if (!conn.connected())
+        {
+            return;
+        }
+        // Tiny message: send() normally gets it out at once; the wait is for a full buffer.
+        conn.send(MSG_SAVING, nullptr, 0);
+        flushOutgoing(250);
     }
 
     // ---- per-frame -----------------------------------------------------------------------
@@ -234,20 +265,18 @@ namespace db::trade
                 sendHello();
                 lastHeard = osGetTime(); // start the silence clock at connect
             }
-            // Heartbeat: a partner that loses power or Wi-Fi never closes the socket, so
-            // silence is the only sign. Ending is safe even while locked: the trade log is
-            // already on the SD card.
             const uint64_t now = osGetTime();
             if (now - lastPingSent >= 2000)
             {
                 conn.send(MSG_PING, nullptr, 0);
                 lastPingSent = now;
             }
-            if (state != Phase::Committed && now - lastHeard > 15000)
-            {
-                end("Lost contact with your partner");
-                return;
-            }
+        }
+        // Any bytes that poll() just read count as hearing from the partner, even if they
+        // don't make up a whole message yet (e.g. right after a long stall on our side).
+        if (conn.lastReceiveTime() > lastHeard)
+        {
+            lastHeard = conn.lastReceiveTime();
         }
         // Read everything that arrived, even if the link just dropped: the partner's READY
         // may be among the last messages, and then this side must commit too so both sides
@@ -272,6 +301,21 @@ namespace db::trade
             }
             tryCommit();
         }
+        // Heartbeat: a partner that loses power or Wi-Fi never closes the socket, so silence
+        // is the only sign. Checked only AFTER the messages above were handled, so a stall
+        // on our side can't end the session with the partner's READY still unread.
+        // Never while locked: we've promised this trade, and the partner may already have
+        // committed it. A BYE or a socket error still ends the session; the trade log
+        // covers the rest. (Committed waits for the UI, which then calls touch().)
+        if (conn.connected() && state != Phase::Ended && state != Phase::Committed && !isLocked)
+        {
+            const uint64_t limit = partnerSaving ? 90000 : 15000;
+            if (osGetTime() - lastHeard > limit)
+            {
+                end("Lost contact with your partner");
+                return;
+            }
+        }
         if (conn.failed() && state != Phase::Committed && state != Phase::Ended)
         {
             end(conn.error().empty() ? "Connection lost" : conn.error());
@@ -291,6 +335,8 @@ namespace db::trade
 
     void Session::handle(const net::Message& m)
     {
+        // The long-silence allowance lasts until the partner's next message of any kind.
+        partnerSaving = m.type == MSG_SAVING;
         switch (m.type)
         {
             case MSG_HELLO:
@@ -298,6 +344,7 @@ namespace db::trade
                 if (m.payload.size() < 3 || get16(m.payload.data()) != PROTOCOL_VERSION)
                 {
                     conn.send(MSG_BYE, nullptr, 0);
+                    flushOutgoing(500); // let the BYE out before end() closes the socket
                     end("Your partner is running a different version of Devious Bank");
                     return;
                 }
@@ -371,8 +418,10 @@ namespace db::trade
                 }
                 break;
             }
+            case MSG_SAVING:
+                break; // only the silence limit (above); offers and locks are untouched
             default:
-                break; // unknown types are ignored
+                break; // unknown types (and PING) are ignored
         }
     }
 

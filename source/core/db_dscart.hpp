@@ -34,6 +34,10 @@ namespace db::dscart
 
     bool read(const CartInfo& cart, std::vector<uint8_t>& out, std::string& err);
     // Writes `image` over a save whose current contents must equal `expected`.
+    // `expected` is updated to what the cart really holds whenever that changed and could be
+    // read back: the new image on success, the actual (possibly mixed) contents after a write
+    // that failed partway or did not verify. That lets the caller retry the full write.
+    // If nothing was written, or the cart could not be re-read, it is left unchanged.
     bool write(const CartInfo& cart, const uint8_t* image, size_t len,
-        const std::vector<uint8_t>& expected, std::string& err);
+        std::vector<uint8_t>& expected, std::string& err);
 }

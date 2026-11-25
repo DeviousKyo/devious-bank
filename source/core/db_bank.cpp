@@ -3,6 +3,7 @@
 #include "core/db_fs.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 
 namespace db
@@ -136,6 +137,7 @@ namespace db
     bool Bank::load(const std::string& filePath, std::string& err)
     {
         path       = filePath;
+        last       = Rollback{}; // a rollback only ever applies to the file it was saved to
         isDirty    = false;
         isReadOnly = false;
         roReason.clear();
@@ -198,16 +200,38 @@ namespace db
             return false;
         }
 
-        // First write of the session: keep a timestamped copy of the bank as it was.
-        if (!backedUpSession && fs::exists(path))
+        // Remember the files exactly as they are, so rollbackLastSave() can put them back if
+        // the game save written after this fails.
+        last = Rollback{};
+        Rollback next;
+        const size_t maxSize = HEADER_SIZE + MAX_BOXES * BOX_RECORD_SIZE;
+        next.hadMain         = fs::exists(path);
+        if (next.hadMain)
         {
-            auto old = fs::readFile(path, HEADER_SIZE + MAX_BOXES * BOX_RECORD_SIZE);
+            auto old = fs::readFile(path, maxSize);
             if (!old)
             {
-                err = "Could not read existing bank for backup";
+                err = "Could not read the existing bank file";
                 return false;
             }
-            BackupResult b = createBackup("BANK", "bank.dbk", old->data(), old->size());
+            next.main = std::move(*old);
+        }
+        const std::string bak = path + ".bak";
+        if (fs::exists(bak))
+        {
+            // Unreadable: rollback then removes the .bak instead of restoring it, so it can
+            // never hold the undone version (a later load could fall back to it).
+            if (auto old = fs::readFile(bak, maxSize))
+            {
+                next.hadBak = true;
+                next.bak    = std::move(*old);
+            }
+        }
+
+        // First write of the session: keep a timestamped copy of the bank as it was.
+        if (!backedUpSession && next.hadMain)
+        {
+            BackupResult b = createBackup("BANK", "bank.dbk", next.main.data(), next.main.size());
             if (!b.ok)
             {
                 err = b.error;
@@ -222,11 +246,82 @@ namespace db
             err = "Writing bank failed (previous bank kept)";
             return false;
         }
+        next.dirty.reserve(boxes.size());
         for (Box& b : boxes)
         {
+            next.dirty.push_back(b.dirty);
             b.dirty.fill(false);
         }
-        isDirty = false;
+        next.valid = true;
+        last       = std::move(next);
+        isDirty    = false;
+        return true;
+    }
+
+    bool Bank::rollbackLastSave(std::string& err)
+    {
+        if (!last.valid)
+        {
+            err = "No bank save to undo";
+            return false;
+        }
+        const size_t maxSize  = HEADER_SIZE + MAX_BOXES * BOX_RECORD_SIZE;
+        const std::string bak = path + ".bak";
+
+        if (last.hadMain)
+        {
+            // writeFileAtomic moves the version being undone to <path>.bak; fixed below.
+            if (!fs::writeFileAtomic(path, last.main.data(), last.main.size()))
+            {
+                err = "Could not write the previous bank back";
+                return false;
+            }
+            auto back = fs::readFile(path, maxSize);
+            if (!back || *back != last.main)
+            {
+                err = "The restored bank file did not verify";
+                return false;
+            }
+
+            // The .bak must not keep the undone version: if bank.dbk were damaged later,
+            // load() would fall back to it and bring back Pokemon the game save still has.
+            bool bakOk = false;
+            if (last.hadBak)
+            {
+                bakOk = fs::writeFileVerified(bak, last.bak.data(), last.bak.size());
+            }
+            if (!bakOk)
+            {
+                std::remove(bak.c_str());
+                bakOk = !fs::exists(bak);
+            }
+            if (!bakOk)
+            {
+                err = "The bank was put back, but bank.dbk.bak still holds the undone version";
+                return false;
+            }
+        }
+        else
+        {
+            // There was no bank file before (save() left any .bak untouched in that case).
+            std::remove(path.c_str());
+            if (fs::exists(path))
+            {
+                err = "Could not remove the new bank file";
+                return false;
+            }
+        }
+
+        // The moves are still in memory: mark them unsaved again so a retry writes them.
+        for (size_t i = 0; i < boxes.size() && i < last.dirty.size(); i++)
+        {
+            for (int s = 0; s < BOX_SLOTS; s++)
+            {
+                boxes[i].dirty[s] = boxes[i].dirty[s] || last.dirty[i][s];
+            }
+        }
+        isDirty = true;
+        last    = Rollback{};
         return true;
     }
 }

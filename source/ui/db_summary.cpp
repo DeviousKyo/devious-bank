@@ -44,6 +44,40 @@ namespace db::ui
 
         std::string orDash(const std::string& s) { return s.empty() ? "--" : s; }
 
+        // Highest national dex number each stored format can hold.
+        int maxSpeciesFor(PkxFormat f)
+        {
+            switch (f)
+            {
+                case PkxFormat::PK1: return 151;
+                case PkxFormat::PK2: return 251;
+                case PkxFormat::PK3: return 386;
+                case PkxFormat::PK4: return 493;
+                case PkxFormat::PK5: return 649;
+                case PkxFormat::PK6: return 721;
+                case PkxFormat::PK7: return 809;
+                default: return 0;
+            }
+        }
+
+        // Level, gender, ability, nature, base stats... all index PKSM-Core's personal
+        // tables by species without a bounds check, so a damaged slot or a hostile trade
+        // offer with species 0 / past the generation's range would read out of bounds.
+        // Forms need no check here: formSpecies() only uses a form below the table's own
+        // formCount() for that (now in-range) species.
+        bool speciesInRange(const pksm::PKX& pk, PkxFormat f)
+        {
+            try
+            {
+                const int species = (int)u16(pk.species());
+                return species >= 1 && species <= maxSpeciesFor(f);
+            }
+            catch (...)
+            {
+                return false; // can't even read the species: treat as bad
+            }
+        }
+
         int iconKeyFor(const pksm::PKX& pk)
         {
             if (pk.egg())
@@ -59,6 +93,7 @@ namespace db::ui
     {
         CellInfo c;
         c.format = slot.format;
+        c.locked = (slot.flags & SLOT_LOCKED) != 0;
         if (slot.empty())
         {
             return c;
@@ -69,6 +104,12 @@ namespace db::ui
         {
             auto pk = slot.toPkx();
             if (!pk)
+            {
+                c.bad  = true;
+                c.name = "???";
+                return c;
+            }
+            if (!speciesInRange(*pk, slot.format))
             {
                 c.bad  = true;
                 c.name = "???";
@@ -113,12 +154,24 @@ namespace db::ui
             s.left.push_back("The bytes are kept as-is and this slot is locked.");
             return s;
         }
+        if (!speciesInRange(*pk, slot.format))
+        {
+            // Everything past this point may touch the personal tables; show only what
+            // is safe to read from the raw bytes.
+            s.title = "???";
+            s.left.push_back(std::string("Format: ") + formatName(slot.format) +
+                             fmt("  (%u bytes)", slot.length));
+            s.left.push_back("Its species number is not valid for this format.");
+            return s;
+        }
 
-        const int gen       = genOf(slot.format);
-        const std::string species = i18n::species(LANG, pk->species());
-        s.iconKey                 = iconKeyFor(*pk);
+        const int gen = genOf(slot.format);
         try
         {
+            // Inside the try: a lookup that throws must not escape into the render loop.
+            const std::string species = i18n::species(LANG, pk->species());
+            s.iconKey                 = iconKeyFor(*pk);
+
             // ---- Title: nickname (species) Lv.X  gender  shiny
             std::string title = pk->egg() ? "Egg" : pk->nickname();
             if (!pk->egg() && pk->nickname() != species)
