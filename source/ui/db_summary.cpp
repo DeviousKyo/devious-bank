@@ -60,7 +60,7 @@ namespace db::ui
             }
         }
 
-        // Level, gender, ability, nature, base stats... all index PKSM-Core's personal
+        // Level, gender, ability, nature, base stats, all index PKSM-Core's personal
         // tables by species without a bounds check, so a damaged slot or a hostile trade
         // offer with species 0 / past the generation's range would read out of bounds.
         // Forms need no check here: formSpecies() only uses a form below the table's own
