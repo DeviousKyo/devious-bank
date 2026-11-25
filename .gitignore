@@ -14,3 +14,6 @@ desktop.ini
 
 # Local Claude settings
 .claude/settings.local.json
+
+# CIA tools (downloaded locally: makerom, bannertool)
+tools/bin/

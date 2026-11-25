@@ -48,6 +48,19 @@ ROMFS		:=	romfs
 APP_TITLE		:=	Devious Bank
 APP_DESCRIPTION	:=	Pokemon storage for Gen 1-7
 APP_AUTHOR		:=	Devious Bank contributors
+ICON			:=	assets/cia/icon.png
+
+# CIA packaging (`make cia`, or `.\build.ps1 cia`). makerom and bannertool live in
+# tools/bin (not committed); the art comes from tools/make_cia_art.ps1.
+VERSION_MAJOR	:=	1
+VERSION_MINOR	:=	0
+VERSION_MICRO	:=	0
+CIA_TOOLS		:=	tools/bin
+MAKEROM			:=	$(CIA_TOOLS)/makerom.exe
+BANNERTOOL		:=	$(CIA_TOOLS)/bannertool.exe
+BANNER_IMAGE	:=	assets/cia/banner.png
+BANNER_AUDIO	:=	assets/cia/banner.wav
+RSF				:=	cia.rsf
 
 #---------------------------------------------------------------------------------
 # options for code generation
@@ -138,11 +151,22 @@ ifneq ($(ROMFS),)
 	export _3DSXFLAGS += --romfs=$(CURDIR)/$(ROMFS)
 endif
 
-.PHONY: all clean
+.PHONY: all clean cia
 
 #---------------------------------------------------------------------------------
 all: $(BUILD) $(DEPSDIR)
 	@$(MAKE) --no-print-directory -C $(BUILD) -f $(CURDIR)/Makefile
+
+#---------------------------------------------------------------------------------
+cia: all
+	@echo building CIA ...
+	@$(BANNERTOOL) makebanner -i $(BANNER_IMAGE) -a $(BANNER_AUDIO) -o $(BUILD)/banner.bnr
+	@$(BANNERTOOL) makesmdh -s "$(APP_TITLE)" -l "$(APP_DESCRIPTION)" -p "$(APP_AUTHOR)" \
+		-i $(ICON) -o $(BUILD)/icon.icn
+	@$(MAKEROM) -f cia -o $(TARGET).cia -target t -exefslogo -rsf $(RSF) \
+		-elf $(TARGET).elf -icon $(BUILD)/icon.icn -banner $(BUILD)/banner.bnr \
+		-major $(VERSION_MAJOR) -minor $(VERSION_MINOR) -micro $(VERSION_MICRO)
+	@echo built ... $(TARGET).cia
 
 $(BUILD):
 	@mkdir -p $@
@@ -155,7 +179,7 @@ endif
 #---------------------------------------------------------------------------------
 clean:
 	@echo clean ...
-	@rm -fr $(BUILD) $(TARGET).3dsx $(OUTPUT).smdh $(TARGET).elf
+	@rm -fr $(BUILD) $(TARGET).3dsx $(OUTPUT).smdh $(TARGET).elf $(TARGET).cia
 
 #---------------------------------------------------------------------------------
 $(GFXBUILD)/%.t3x	$(BUILD)/%.h	:	%.t3s
