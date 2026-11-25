@@ -19,7 +19,7 @@ namespace db::ui
 
     namespace col
     {
-        inline constexpr u32 BG        = rgba(0.2f, 0.2f, 0.2f);
+        inline constexpr u32 BG        = rgba(0x33, 0x33, 0x33); // 20% gray
         inline constexpr u32 PANEL     = rgba(0x2A, 0x2C, 0x3A);
         inline constexpr u32 CELL      = rgba(0x38, 0x3B, 0x4E);
         inline constexpr u32 CELL_FULL = rgba(0x4A, 0x5A, 0x7A);
