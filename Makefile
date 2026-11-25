@@ -189,7 +189,12 @@ $(GFXBUILD)/%.t3x	$(BUILD)/%.h	:	%.t3s
 #---------------------------------------------------------------------------------
 else
 
-$(OUTPUT).3dsx	:	$(OUTPUT).elf $(_3DSXDEPS)
+# The .3dsx embeds romfs, so rebuild it when any romfs file (game art, sprites, data)
+# changes, not only when the code does. Not exported: ~850 paths would overflow the
+# Windows environment block and break every tool the build runs.
+ROMFS_FILES	:=	$(if $(ROMFS),$(shell find $(TOPDIR)/$(ROMFS) -type f))
+
+$(OUTPUT).3dsx	:	$(OUTPUT).elf $(_3DSXDEPS) $(ROMFS_FILES)
 
 $(OFILES_SOURCES) : $(HFILES)
 
